@@ -31,4 +31,12 @@ describe('crypto', () => {
     const b = await encrypt(key, 'same text');
     expect(a).not.toBe(b);
   });
+
+  it('round-trips large plaintext (>200KB) without hitting call stack limits', async () => {
+    const { key } = await deriveKey('1234');
+    const largePlaintext = 'x'.repeat(250_000);
+    const combined = await encrypt(key, largePlaintext);
+    const result = await decrypt(key, combined);
+    expect(result).toBe(largePlaintext);
+  });
 });

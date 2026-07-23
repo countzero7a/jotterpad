@@ -1,7 +1,13 @@
 const PBKDF2_ITERATIONS = 600_000;
 
 function toBase64(bytes: Uint8Array): string {
-  return btoa(String.fromCharCode(...bytes));
+  const chunkSize = 8192;
+  let str = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.slice(i, i + chunkSize);
+    str += String.fromCharCode(...chunk);
+  }
+  return btoa(str);
 }
 
 function fromBase64(value: string): Uint8Array {
