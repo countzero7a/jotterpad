@@ -1423,10 +1423,14 @@ describe('Timeline', () => {
   it('adds an event through the capture bar after toggling to event mode', async () => {
     const user = userEvent.setup({ delay: null });
     const onAddEvent = vi.fn();
-    render(<Timeline entries={[]} onAddNote={vi.fn()} onAddEvent={onAddEvent} onDelete={vi.fn()} />);
+    const { container } = render(
+      <Timeline entries={[]} onAddNote={vi.fn()} onAddEvent={onAddEvent} onDelete={vi.fn()} />
+    );
     await user.click(screen.getByRole('button', { name: 'Note' }));
     await user.type(screen.getByPlaceholderText('Jot a thought...'), 'dentist');
-    fireDateInput(screen.getByDisplayValue(''), '2026-08-01');
+    const dateInput = container.querySelector('input[type="date"]');
+    if (!dateInput) throw new Error('date input not found');
+    fireDateInput(dateInput, '2026-08-01');
     await user.click(screen.getByRole('button', { name: 'Add' }));
     expect(onAddEvent).toHaveBeenCalledWith('dentist', '2026-08-01', '');
   });
