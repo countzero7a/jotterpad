@@ -4,7 +4,9 @@ import { getMeta, setMeta } from '../storage/db';
 const VERIFIER_PLAINTEXT = 'jotterpad-verify';
 
 export async function isPinConfigured(): Promise<boolean> {
-  return (await getMeta('salt')) !== undefined;
+  const salt = await getMeta('salt');
+  const verifier = await getMeta('verifier');
+  return salt !== undefined && verifier !== undefined;
 }
 
 export async function setupPin(pin: string): Promise<CryptoKey> {

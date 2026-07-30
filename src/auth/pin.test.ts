@@ -38,4 +38,12 @@ describe('pin', () => {
     const key = await unlockWithPin('4242');
     expect(key).toBeNull();
   });
+
+  it('reports not configured when verifier is missing after partial setup', async () => {
+    await setupPin('4242');
+    expect(await isPinConfigured()).toBe(true);
+    const db = await getDb();
+    await db.delete('meta', 'verifier');
+    expect(await isPinConfigured()).toBe(false);
+  });
 });
