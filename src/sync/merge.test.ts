@@ -95,4 +95,22 @@ describe('mergeEntries', () => {
     const { conflicts } = mergeEntries(local, remote, 0);
     expect(conflicts).toHaveLength(1);
   });
+
+  it('preserves local-only entries when merging with distinct remote entries', () => {
+    const local = [makeEntry({ id: 'local-only', text: 'only on local device' })];
+    const remote = [makeEntry({ id: 'remote-only', text: 'only on remote device' })];
+    const { merged, conflicts } = mergeEntries(local, remote, 0);
+    expect(merged).toHaveLength(2);
+    expect(merged.find((e) => e.id === 'local-only')).toBeDefined();
+    expect(merged.find((e) => e.id === 'remote-only')).toBeDefined();
+    expect(conflicts).toHaveLength(0);
+  });
+
+  it('does not flag a conflict when tag order differs but content is otherwise identical', () => {
+    const local = [makeEntry({ id: 'a', tags: ['x', 'y'], modifiedAt: 1000 })];
+    const remote = [makeEntry({ id: 'a', tags: ['y', 'x'], modifiedAt: 1000 })];
+    const { merged, conflicts } = mergeEntries(local, remote, 0);
+    expect(merged).toHaveLength(1);
+    expect(conflicts).toHaveLength(0);
+  });
 });
