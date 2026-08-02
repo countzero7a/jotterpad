@@ -25,6 +25,21 @@ describe('chunkPayload and parseFrame', () => {
     expect(() => parseFrame('not json')).toThrow();
     expect(() => parseFrame(JSON.stringify({ seq: 0 }))).toThrow();
   });
+
+  it('throws when seq is >= total', () => {
+    expect(() =>
+      parseFrame(JSON.stringify({ seq: 5, total: 3, sessionId: 'x', payload: 'y' }))
+    ).toThrow('Invalid QR frame');
+    expect(() =>
+      parseFrame(JSON.stringify({ seq: 3, total: 3, sessionId: 'x', payload: 'y' }))
+    ).toThrow('Invalid QR frame');
+  });
+
+  it('throws when seq is negative', () => {
+    expect(() =>
+      parseFrame(JSON.stringify({ seq: -1, total: 3, sessionId: 'x', payload: 'y' }))
+    ).toThrow('Invalid QR frame');
+  });
 });
 
 describe('FrameReassembler', () => {
@@ -68,5 +83,29 @@ describe('FrameReassembler', () => {
   it('throws if getResult is called before completion', () => {
     const reassembler = new FrameReassembler();
     expect(() => reassembler.getResult()).toThrow();
+  });
+
+  it('detects false completion: explicit index check prevents seq overflow', () => {
+    const bigArray = Array.from({ length: 100 }, (_, i) => ({ id: i, text: 'x'.repeat(20) }));
+    const frames = chunkPayload(bigArray, 'session-5').map(parseFrame);
+    const frameCount = frames.length;
+
+    const reassembler = new FrameReassembler();
+    const realLastIndex = frameCount - 1;
+
+    for (let i = 0; i < realLastIndex; i++) {
+      reassembler.addFrame(frames[i]);
+    }
+
+    const bogusFrame: QrFrame = {
+      seq: frameCount,
+      total: frameCount,
+      sessionId: 'session-5',
+      payload: 'wrong-payload',
+    };
+
+    reassembler.addFrame(bogusFrame);
+
+    expect(reassembler.isComplete()).toBe(false);
   });
 });

@@ -28,6 +28,9 @@ export function parseFrame(raw: string): QrFrame {
   ) {
     throw new Error('Invalid QR frame');
   }
+  if (frame.seq < 0 || frame.seq >= frame.total) {
+    throw new Error('Invalid QR frame');
+  }
   return frame as QrFrame;
 }
 
@@ -46,7 +49,15 @@ export class FrameReassembler {
   }
 
   isComplete(): boolean {
-    return this.sessionId !== null && this.chunks.size === this.total;
+    if (this.sessionId === null || this.chunks.size !== this.total) {
+      return false;
+    }
+    for (let i = 0; i < this.total; i++) {
+      if (!this.chunks.has(i)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   getResult<T>(): T {
