@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { chunkPayload, parseFrame, FrameReassembler } from './qrProtocol';
+import { chunkPayload, parseFrame, FrameReassembler, type QrFrame } from './qrProtocol';
 
 describe('chunkPayload and parseFrame', () => {
   it('produces a single frame for a small payload', () => {
