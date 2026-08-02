@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import 'fake-indexeddb/auto';
 import { LockScreen } from './LockScreen';
 import { setupPin } from '../auth/pin';
+import * as pinModule from '../auth/pin';
 import { getDb } from '../storage/db';
 
 async function resetDb() {
@@ -57,5 +58,18 @@ describe('LockScreen', () => {
     await user.type(screen.getByPlaceholderText('PIN'), '4242');
     await user.click(screen.getByRole('button', { name: 'Unlock' }));
     await waitFor(() => expect(onUnlock).toHaveBeenCalledTimes(1));
+  });
+
+  it('shows an error message when setupPin fails', async () => {
+    const user = userEvent.setup();
+    const setupSpy = vi.spyOn(pinModule, 'setupPin').mockRejectedValue(new Error('Storage error'));
+    const onUnlock = vi.fn();
+    render(<LockScreen mode="setup" onUnlock={onUnlock} />);
+    await user.type(screen.getByPlaceholderText('PIN'), '1234');
+    await user.type(screen.getByPlaceholderText('Confirm PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Set PIN' }));
+    await waitFor(() => expect(screen.getByText(/Something went wrong/i)).toBeInTheDocument());
+    expect(onUnlock).not.toHaveBeenCalled();
+    setupSpy.mockRestore();
   });
 });

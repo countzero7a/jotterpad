@@ -14,24 +14,28 @@ export function LockScreen({ mode, onUnlock }: LockScreenProps) {
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError('');
-    if (mode === 'setup') {
-      if (pin.length < 4) {
-        setError('PIN must be at least 4 digits.');
-        return;
+    try {
+      if (mode === 'setup') {
+        if (pin.length < 4) {
+          setError('PIN must be at least 4 digits.');
+          return;
+        }
+        if (pin !== confirmPin) {
+          setError('PINs do not match.');
+          return;
+        }
+        const key = await setupPin(pin);
+        onUnlock(key);
+      } else {
+        const key = await unlockWithPin(pin);
+        if (!key) {
+          setError('Incorrect PIN.');
+          return;
+        }
+        onUnlock(key);
       }
-      if (pin !== confirmPin) {
-        setError('PINs do not match.');
-        return;
-      }
-      const key = await setupPin(pin);
-      onUnlock(key);
-    } else {
-      const key = await unlockWithPin(pin);
-      if (!key) {
-        setError('Incorrect PIN.');
-        return;
-      }
-      onUnlock(key);
+    } catch (error) {
+      setError('Something went wrong. Please try again.');
     }
   }
 
