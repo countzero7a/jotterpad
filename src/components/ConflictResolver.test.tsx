@@ -27,4 +27,14 @@ describe('ConflictResolver', () => {
     await user.click(screen.getByText(/local version/));
     expect(onResolve).toHaveBeenCalledWith(local);
   });
+
+  it('calls onResolve with the remote version when the other device button is clicked', async () => {
+    const user = userEvent.setup();
+    const local = createNote('local version', 'device-a');
+    const remote = createNote('remote version', 'device-b');
+    const onResolve = vi.fn();
+    render(<ConflictResolver conflicts={[{ local, remote }]} onResolve={onResolve} />);
+    await user.click(screen.getByText(/remote version/));
+    expect(onResolve).toHaveBeenCalledWith(remote);
+  });
 });

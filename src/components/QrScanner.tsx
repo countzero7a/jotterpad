@@ -10,6 +10,7 @@ export function QrScanner({ onComplete }: QrScannerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [framesReceived, setFramesReceived] = useState(0);
   const [totalFrames, setTotalFrames] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const reassembler = new FrameReassembler();
@@ -17,7 +18,16 @@ export function QrScanner({ onComplete }: QrScannerProps) {
     let cancelled = false;
 
     async function start() {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      } catch {
+        setError('Camera access failed. Check permissions and try again.');
+        return;
+      }
+      if (cancelled) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       const video = videoRef.current;
       if (video) {
         video.srcObject = stream;
@@ -56,7 +66,9 @@ export function QrScanner({ onComplete }: QrScannerProps) {
       tick();
     }
 
-    start();
+    start().catch(() => {
+      setError('Camera access failed. Check permissions and try again.');
+    });
 
     return () => {
       cancelled = true;
@@ -67,7 +79,11 @@ export function QrScanner({ onComplete }: QrScannerProps) {
   return (
     <div className="qr-scanner">
       <video ref={videoRef} muted playsInline />
-      <p>{totalFrames ? `Received ${framesReceived} of ${totalFrames} frames` : 'Point camera at QR code...'}</p>
+      {error ? (
+        <p role="alert">{error}</p>
+      ) : (
+        <p>{totalFrames ? `Received ${framesReceived} of ${totalFrames} frames` : 'Point camera at QR code...'}</p>
+      )}
     </div>
   );
 }
