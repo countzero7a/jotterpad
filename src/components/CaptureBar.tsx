@@ -33,8 +33,8 @@ export function CaptureBar({ onAddNote, onAddEvent }: CaptureBarProps) {
       <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Jot a thought..." />
       {mode === 'event' && (
         <>
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} onInput={(e) => setDate((e.target as HTMLInputElement).value)} />
-          <input type="time" value={time} onChange={(e) => setTime(e.target.value)} onInput={(e) => setTime((e.target as HTMLInputElement).value)} />
+          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          <input type="time" value={time} onChange={(e) => setTime(e.target.value)} />
         </>
       )}
       <button type="submit">Add</button>

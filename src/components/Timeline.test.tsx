@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Timeline } from './Timeline';
@@ -49,9 +49,9 @@ describe('Timeline', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Note' }));
     await user.type(screen.getByPlaceholderText('Jot a thought...'), 'dentist');
-    const dateInput = container.querySelector('input[type="date"]');
+    const dateInput = container.querySelector('input[type="date"]') as HTMLInputElement;
     if (!dateInput) throw new Error('date input not found');
-    fireDateInput(dateInput, '2026-08-01');
+    fireEvent.change(dateInput, { target: { value: '2026-08-01' } });
     await user.click(screen.getByRole('button', { name: 'Add' }));
     expect(onAddEvent).toHaveBeenCalledWith('dentist', '2026-08-01', '');
   });
@@ -65,8 +65,3 @@ describe('Timeline', () => {
     expect(onDelete).toHaveBeenCalledWith(note.id);
   });
 });
-
-function fireDateInput(input: HTMLElement, value: string) {
-  (input as HTMLInputElement).value = value;
-  input.dispatchEvent(new Event('input', { bubbles: true }));
-}
