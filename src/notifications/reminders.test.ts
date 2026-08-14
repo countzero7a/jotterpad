@@ -7,7 +7,10 @@ describe('reminders', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-07-23T12:00:00Z'));
+    // Local-time construction (not a UTC ISO string) so "now" and the
+    // production code's local-time event parsing agree on the same
+    // timezone, regardless of the machine running the test.
+    vi.setSystemTime(new Date(2026, 6, 23, 12, 0, 0));
     // @ts-expect-error test stub for the global Notification API
     global.Notification = vi.fn().mockImplementation((...args) => notificationSpy(...args));
     // @ts-expect-error test stub
@@ -45,5 +48,15 @@ describe('reminders', () => {
     scheduleEventReminders([event]);
     vi.advanceTimersByTime(48 * 60 * 60 * 1000);
     expect(notificationSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not fire duplicate notifications when scheduled repeatedly for the same event', () => {
+    const event = createEvent('dentist', '2026-07-23', '18:00', 'device-1');
+    // Simulate the app re-scheduling reminders on every entries reload
+    // (e.g. Task 14's wiring) with overlapping event lists.
+    scheduleEventReminders([event]);
+    scheduleEventReminders([event]);
+    vi.advanceTimersByTime(6 * 60 * 60 * 1000 + 1000);
+    expect(notificationSpy).toHaveBeenCalledTimes(1);
   });
 });
