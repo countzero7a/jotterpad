@@ -62,7 +62,7 @@ export default function App() {
 
   const nonDeleted = entries.filter((e) => !e.deleted);
   const visible = filterEntries(nonDeleted, query, selectedTags);
-  const allTags = Array.from(new Set(nonDeleted.flatMap((e) => e.tags)));
+  const allTags = Array.from(new Set([...nonDeleted.flatMap((e) => e.tags), ...selectedTags]));
 
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
     setEntries(merged);

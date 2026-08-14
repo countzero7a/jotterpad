@@ -6,6 +6,12 @@ import App from './App';
 import { getDb } from './storage/db';
 import { setupPin } from './auth/pin';
 import { restoreBackup } from './backup/backup';
+import { scheduleEventReminders } from './notifications/reminders';
+
+vi.mock('./notifications/reminders', () => ({
+  scheduleEventReminders: vi.fn(),
+  requestNotificationPermission: vi.fn().mockResolvedValue('granted'),
+}));
 
 async function resetDb() {
   const db = await getDb();
@@ -114,5 +120,59 @@ describe('App', () => {
 
     expect(restored.some((e) => e.text === 'visible note')).toBe(true);
     expect(restored.some((e) => e.text === 'hidden note')).toBe(true);
+  });
+
+  it('keeps an active tag filter chip visible and clickable after its last entry is deleted', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'buy milk #work');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('buy milk #work');
+
+    // Select the #work filter chip.
+    await user.click(screen.getByRole('button', { name: '#work' }));
+
+    // Delete the only entry carrying the #work tag.
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(screen.queryByText('buy milk #work')).not.toBeInTheDocument());
+
+    // The chip must stay visible (and clickable) even though no non-deleted
+    // entry carries #work anymore — otherwise the filter is stuck on forever.
+    expect(screen.getByRole('button', { name: '#work' })).toBeInTheDocument();
+
+    // Capture a new note that does NOT have the #work tag. While the stale
+    // filter is still active, it should be hidden from the timeline.
+    await user.type(captureInput, 'fresh thought');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    expect(screen.queryByText('fresh thought')).not.toBeInTheDocument();
+
+    // Clicking the still-visible chip clears the filter, revealing the new note.
+    await user.click(screen.getByRole('button', { name: '#work' }));
+    expect(await screen.findByText('fresh thought')).toBeInTheDocument();
+  });
+
+  it('reschedules reminders after entries change, not just once at initial load', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    await waitFor(() => expect(vi.mocked(scheduleEventReminders).mock.calls.length).toBeGreaterThan(0));
+    const callsBeforeCapture = vi.mocked(scheduleEventReminders).mock.calls.length;
+
+    await user.type(await screen.findByPlaceholderText('Jot a thought...'), 'reminder regression note');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('reminder regression note');
+
+    await waitFor(() =>
+      expect(vi.mocked(scheduleEventReminders).mock.calls.length).toBeGreaterThan(callsBeforeCapture)
+    );
+    expect(vi.mocked(scheduleEventReminders).mock.calls.length).toBeGreaterThan(1);
+
+    const calls = vi.mocked(scheduleEventReminders).mock.calls;
+    const lastCallEntries = calls[calls.length - 1][0];
+    expect(lastCallEntries.some((e) => e.text === 'reminder regression note')).toBe(true);
   });
 });
