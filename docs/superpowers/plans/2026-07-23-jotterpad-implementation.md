@@ -2887,6 +2887,584 @@ Run: `npm run build && npm run dev`, then in a browser:
 
 ---
 
+## Task 15: Edit Entry
+
+**Added after initial plan review**: the original 14 tasks covered add and delete but never editing an existing note/event, contradicting the design spec's "tap an entry to edit in place" requirement (Section 6) and leaving the conflict-resolution path (Tasks 7/11) essentially unexercisable in normal use, since two devices only diverge on the same entry if both edit it.
+
+**Files:**
+- Modify: `src/models/entry.ts`
+- Modify: `src/models/entry.test.ts`
+- Modify: `src/components/EntryItem.tsx`
+- Create: `src/components/EntryItem.test.tsx`
+- Modify: `src/components/Timeline.tsx`
+- Modify: `src/components/Timeline.test.tsx`
+- Modify: `src/App.tsx`
+- Modify: `src/App.test.tsx`
+
+**Interfaces:**
+- Consumes: `Entry`, `parseTags` from `src/models/entry.ts` (Task 3).
+- Produces: `updateEntry(entry: Entry, rawText: string, deviceId: string, eventDate?: string, eventTime?: string): Entry`; `EntryItem`'s new `onEdit: (id: string, rawText: string, eventDate?: string, eventTime?: string) => void` prop; `Timeline`'s new `onEdit` prop of the same shape, threaded through to every `EntryItem` it renders.
+
+- [ ] **Step 1: Write the failing tests for `updateEntry`**
+
+```ts
+// append to src/models/entry.test.ts
+describe('updateEntry', () => {
+  it('updates text and tags while bumping modifiedAt and deviceId', () => {
+    const original = createNote('old text #old', 'device-1');
+    const updated = updateEntry(original, 'new text #new', 'device-2');
+    expect(updated.text).toBe('new text #new');
+    expect(updated.tags).toEqual(['new']);
+    expect(updated.deviceId).toBe('device-2');
+    expect(updated.modifiedAt).toBeGreaterThanOrEqual(original.modifiedAt);
+    expect(updated.id).toBe(original.id);
+    expect(updated.createdAt).toBe(original.createdAt);
+  });
+
+  it('updates eventDate/eventTime for an event', () => {
+    const original = createEvent('dentist', '2026-08-01', '09:00', 'device-1');
+    const updated = updateEntry(original, 'dentist checkup', 'device-1', '2026-08-02', '10:00');
+    expect(updated.eventDate).toBe('2026-08-02');
+    expect(updated.eventTime).toBe('10:00');
+  });
+
+  it('does not add eventDate/eventTime to a note', () => {
+    const original = createNote('just a note', 'device-1');
+    const updated = updateEntry(original, 'still a note', 'device-1', '2026-08-02', '10:00');
+    expect(updated.eventDate).toBeUndefined();
+    expect(updated.eventTime).toBeUndefined();
+  });
+});
+```
+
+Add `updateEntry` to the existing `import { ... } from './entry'` line at the top of the test file.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npm test -- entry`
+Expected: FAIL — `updateEntry` does not exist yet.
+
+- [ ] **Step 3: Add `updateEntry` to `src/models/entry.ts`**
+
+```ts
+export function updateEntry(
+  entry: Entry,
+  rawText: string,
+  deviceId: string,
+  eventDate?: string,
+  eventTime?: string
+): Entry {
+  const { text, tags } = parseTags(rawText);
+  const updated: Entry = { ...entry, text, tags, modifiedAt: Date.now(), deviceId };
+  if (entry.type === 'event') {
+    updated.eventDate = eventDate ?? entry.eventDate;
+    updated.eventTime = eventTime;
+  }
+  return updated;
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npm test -- entry`
+Expected: PASS (14 tests: the original 11 plus these 3)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/models/entry.ts src/models/entry.test.ts
+git commit -m "feat: add updateEntry for editing existing notes and events"
+```
+
+- [ ] **Step 6: Write the failing tests for `EntryItem`'s edit mode**
+
+```tsx
+// src/components/EntryItem.test.tsx
+import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, it, expect, vi } from 'vitest';
+import { EntryItem } from './EntryItem';
+import { createNote, createEvent } from '../models/entry';
+
+describe('EntryItem', () => {
+  it('renders entry text and tags', () => {
+    const entry = createNote('buy milk #errand', 'device-1');
+    render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+    expect(screen.getByText('buy milk #errand')).toBeInTheDocument();
+    expect(screen.getByText('#errand')).toBeInTheDocument();
+  });
+
+  it('switches to an editable form when Edit is clicked', async () => {
+    const user = userEvent.setup();
+    const entry = createNote('buy milk', 'device-1');
+    render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(screen.getByDisplayValue('buy milk')).toBeInTheDocument();
+  });
+
+  it('calls onEdit with the updated text on Save', async () => {
+    const user = userEvent.setup();
+    const onEdit = vi.fn();
+    const entry = createNote('buy milk', 'device-1');
+    render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={onEdit} />);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('buy milk');
+    await user.clear(input);
+    await user.type(input, 'buy oat milk');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onEdit).toHaveBeenCalledWith(entry.id, 'buy oat milk', undefined, undefined);
+  });
+
+  it('discards changes on Cancel', async () => {
+    const user = userEvent.setup();
+    const onEdit = vi.fn();
+    const entry = createNote('buy milk', 'device-1');
+    render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={onEdit} />);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('buy milk');
+    await user.clear(input);
+    await user.type(input, 'changed');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(screen.getByText('buy milk')).toBeInTheDocument();
+  });
+
+  it('shows and updates date/time fields for an event', async () => {
+    const user = userEvent.setup();
+    const onEdit = vi.fn();
+    const entry = createEvent('dentist', '2026-08-01', '09:00', 'device-1');
+    const { container } = render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={onEdit} />);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const dateInput = container.querySelector('input[type="date"]');
+    if (!dateInput) throw new Error('date input not found');
+    fireEvent.change(dateInput, { target: { value: '2026-08-05' } });
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onEdit).toHaveBeenCalledWith(entry.id, 'dentist', '2026-08-05', '09:00');
+  });
+});
+```
+
+- [ ] **Step 7: Run tests to verify they fail**
+
+Run: `npm test -- EntryItem`
+Expected: FAIL — `EntryItem` doesn't accept `onEdit` or render an edit form yet.
+
+- [ ] **Step 8: Rewrite `src/components/EntryItem.tsx`**
+
+```tsx
+import { useState } from 'react';
+import { Entry } from '../models/entry';
+
+interface EntryItemProps {
+  entry: Entry;
+  onDelete: (id: string) => void;
+  onEdit: (id: string, rawText: string, eventDate?: string, eventTime?: string) => void;
+}
+
+export function EntryItem({ entry, onDelete, onEdit }: EntryItemProps) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(entry.text);
+  const [eventDate, setEventDate] = useState(entry.eventDate ?? '');
+  const [eventTime, setEventTime] = useState(entry.eventTime ?? '');
+
+  function handleSave() {
+    if (!text.trim()) return;
+    onEdit(
+      entry.id,
+      text,
+      entry.type === 'event' ? eventDate : undefined,
+      entry.type === 'event' ? eventTime : undefined
+    );
+    setEditing(false);
+  }
+
+  function handleCancel() {
+    setText(entry.text);
+    setEventDate(entry.eventDate ?? '');
+    setEventTime(entry.eventTime ?? '');
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <div className="entry entry-editing" data-type={entry.type}>
+        <input value={text} onChange={(e) => setText(e.target.value)} />
+        {entry.type === 'event' && (
+          <>
+            <input type="date" value={eventDate} onChange={(e) => setEventDate(e.target.value)} />
+            <input type="time" value={eventTime} onChange={(e) => setEventTime(e.target.value)} />
+          </>
+        )}
+        <button onClick={handleSave}>Save</button>
+        <button onClick={handleCancel}>Cancel</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="entry" data-type={entry.type}>
+      <span>{entry.type === 'event' ? '📅' : '📝'}</span>
+      <span>{entry.text}</span>
+      {entry.type === 'event' && (
+        <span>
+          {entry.eventDate} {entry.eventTime}
+        </span>
+      )}
+      {entry.tags.map((tag) => (
+        <span key={tag} className="tag">
+          #{tag}
+        </span>
+      ))}
+      <button onClick={() => setEditing(true)}>Edit</button>
+      <button onClick={() => onDelete(entry.id)}>Delete</button>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 9: Run tests to verify they pass**
+
+Run: `npm test -- EntryItem`
+Expected: PASS (5 tests)
+
+- [ ] **Step 10: Update `Timeline` to thread `onEdit` through, and update its tests**
+
+In `src/components/Timeline.tsx`, add `onEdit: (id: string, rawText: string, eventDate?: string, eventTime?: string) => void;` to `TimelineProps`, accept it in the destructured props, and pass `onEdit={onEdit}` to both `<EntryItem>` render calls (the `past.map` and `upcoming.map` blocks).
+
+In `src/components/Timeline.test.tsx`, add `onEdit={vi.fn()}` to every existing `render(<Timeline ... />)` call (all 5 existing tests), then add one new test:
+
+```tsx
+it('threads edits through to onEdit', async () => {
+  const user = userEvent.setup({ delay: null });
+  const onEdit = vi.fn();
+  const note = createNote('buy milk', 'device-1');
+  render(
+    <Timeline entries={[note]} onAddNote={vi.fn()} onAddEvent={vi.fn()} onDelete={vi.fn()} onEdit={onEdit} />
+  );
+  await user.click(screen.getByRole('button', { name: 'Edit' }));
+  const input = screen.getByDisplayValue('buy milk');
+  await user.clear(input);
+  await user.type(input, 'buy oat milk');
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+  expect(onEdit).toHaveBeenCalledWith(note.id, 'buy oat milk', undefined, undefined);
+});
+```
+
+- [ ] **Step 11: Run tests to verify they pass**
+
+Run: `npm test -- Timeline`
+Expected: PASS (6 tests: the original 5 plus this one)
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add src/components/EntryItem.tsx src/components/EntryItem.test.tsx src/components/Timeline.tsx src/components/Timeline.test.tsx
+git commit -m "feat: add edit mode to EntryItem and thread onEdit through Timeline"
+```
+
+- [ ] **Step 13: Wire editing into `App.tsx`**
+
+In `src/App.tsx`, add `updateEntry` to the existing `import { createNote, createEvent, filterEntries, Entry } from './models/entry';` line. Add this handler alongside `handleDelete`:
+
+```tsx
+async function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
+  const existing = entries.find((e) => e.id === id);
+  if (!existing) return;
+  const updated = updateEntry(existing, rawText, deviceId, eventDate, eventTime);
+  await saveEntry(key, updated);
+  setEntries((prev) => prev.map((e) => (e.id === id ? updated : e)));
+}
+```
+
+Pass `onEdit={handleEdit}` to the existing `<Timeline ... />` element.
+
+Add a test to `src/App.test.tsx` (following the file's existing style, with `findBy*`/`waitFor` for async assertions):
+
+```tsx
+it('edits a captured note and shows the updated text', async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+  await user.type(screen.getByPlaceholderText('Confirm PIN'), '1234');
+  await user.click(screen.getByRole('button', { name: 'Set PIN' }));
+
+  await user.type(await screen.findByPlaceholderText('Jot a thought...'), 'buy milk');
+  await user.click(screen.getByRole('button', { name: 'Add' }));
+  await screen.findByText('buy milk');
+
+  await user.click(screen.getByRole('button', { name: 'Edit' }));
+  const input = screen.getByDisplayValue('buy milk');
+  await user.clear(input);
+  await user.type(input, 'buy oat milk');
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+
+  expect(await screen.findByText('buy oat milk')).toBeInTheDocument();
+  expect(screen.queryByText('buy milk')).not.toBeInTheDocument();
+});
+```
+
+- [ ] **Step 14: Run tests to verify they pass**
+
+Run: `npm test -- App`
+Expected: PASS (8 tests: the existing 7 plus this one)
+
+- [ ] **Step 15: Run the full suite and build**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run build`
+Expected: all pass, zero type errors, build succeeds.
+
+- [ ] **Step 16: Commit**
+
+```bash
+git add src/App.tsx src/App.test.tsx
+git commit -m "feat: wire entry editing into the app"
+```
+
+---
+
+## Task 16: Visual Styling
+
+**Added after initial plan review**: none of the first 14 tasks included a stylesheet — every component renders unstyled HTML. This task applies the chat-style layout approved during design (Option B from brainstorming: bottom-pinned capture bar, chronological feed scrolling above it) as real CSS, covering the main app shell, timeline/entries, lock screen, sync screen, conflict resolver, and settings panel.
+
+**Files:**
+- Create: `src/index.css`
+- Modify: `src/main.tsx`
+
+**Interfaces:**
+- Consumes: the `className`/`data-type` attributes already present on existing components (`app`, `entry`, `tag`, `capture-bar`, `timeline`, `feed`, `lock-screen`, `sync-screen`, `qr-display`, `qr-scanner`, `conflict-resolver`, `settings`, `tag-filter-bar`, `search-bar`, `entry-editing`) — this task only adds CSS rules targeting these, it does not rename or add new class hooks to components.
+- Produces: no new exports; purely visual.
+
+This task is presentational only — it has no unit-testable logic, so there's no TDD cycle. Verification is: the full test suite still passes unchanged (since no component markup/class names change), plus a manual visual check in a running browser.
+
+- [ ] **Step 1: Write `src/index.css`**
+
+```css
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1c1c1e;
+  --muted: #6b6b70;
+  --border: #e0e0e2;
+  --accent: #2f6fed;
+  --danger: #d33;
+  --surface: #f5f5f7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --fg: #f2f2f2;
+    --muted: #9a9a9e;
+    --border: #333336;
+    --accent: #6ea2ff;
+    --danger: #ff6b6b;
+    --surface: #2a2a2d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 12px;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+input {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.app > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.app > header h1 {
+  font-size: 18px;
+  margin: 0;
+  flex: 1;
+}
+
+.search-bar {
+  margin: 8px 12px;
+  width: calc(100% - 24px);
+}
+
+.tag-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+
+.tag-filter-bar .tag {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 13px;
+}
+
+.tag-filter-bar .tag.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.timeline {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.feed {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.entry {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.entry[data-type='event'] {
+  border-left: 3px solid var(--accent);
+}
+
+.entry .tag {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.entry button {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.entry-editing {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.capture-bar {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.capture-bar input {
+  flex: 1;
+}
+
+.lock-screen {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 320px;
+  margin: 15vh auto 0;
+  padding: 0 16px;
+}
+
+.lock-screen [role='alert'] {
+  color: var(--danger);
+  font-size: 14px;
+}
+
+.sync-screen,
+.settings,
+.conflict-resolver {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.qr-display canvas {
+  max-width: 100%;
+  height: auto;
+}
+
+.qr-scanner video {
+  width: 100%;
+  border-radius: 8px;
+}
+```
+
+- [ ] **Step 2: Import it in `src/main.tsx`**
+
+Add `import './index.css';` as the first line of `src/main.tsx`, above the existing `react`/`react-dom` imports.
+
+- [ ] **Step 3: Run the full suite to confirm nothing broke**
+
+Run: `npm test`
+Expected: PASS, same test count as before this task — no component class names changed, so no test should be affected by adding a stylesheet.
+
+- [ ] **Step 4: Build and manually verify**
+
+Run: `npm run build && npm run dev`
+
+In a browser: confirm the capture bar sits pinned at the bottom of the viewport, the feed scrolls above it, tag chips and the active-filter highlight are visually distinct, event entries show a visible accent border, and the lock screen/sync screen/settings panel/conflict resolver are all legible in both light and dark OS themes (toggle OS theme or use browser devtools to force `prefers-color-scheme`).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/index.css src/main.tsx
+git commit -m "feat: add visual styling for the chat-style layout"
+```
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage:** Overview/architecture → Tasks 1, 14. Security (PIN, encryption, warnings) → Tasks 2, 5, 6, 12. Data model → Task 3. Sync protocol (QR, merge, first-sync-is-full-merge) → Tasks 7, 8, 11. UI (timeline, capture bar, future events, tag/search, lock screen, export/import, reminder caveat) → Tasks 6, 9, 10, 11, 12, 13. Tech stack → Task 1 (scaffold), 11 (qrcode/jsqr). Testing approach (merge + crypto prioritized, QR flow manual) → reflected throughout, explicit in Task 11.
