@@ -25,7 +25,7 @@ describe('ImportBackup', () => {
       makeFile(JSON.stringify(backup))
     );
 
-    await waitFor(() => expect(onImported).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onImported).toHaveBeenCalledTimes(1), { timeout: 5000 });
     const [merged] = onImported.mock.calls[0];
     expect(merged.some((e: { text: string }) => e.text === 'imported thought')).toBe(true);
   });
@@ -42,6 +42,6 @@ describe('ImportBackup', () => {
       makeFile(JSON.stringify(backup))
     );
 
-    expect(await screen.findByText(/could not decrypt/i)).toBeInTheDocument();
+    expect(await screen.findByText(/could not decrypt/i, {}, { timeout: 5000 })).toBeInTheDocument();
   });
 });

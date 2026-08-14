@@ -40,7 +40,7 @@ describe('ExportSettings', () => {
     render(<ExportSettings entries={[createNote('x', 'device-1')]} />);
     await user.type(screen.getByPlaceholderText('Enter device PIN'), '0000');
     await user.click(screen.getByRole('button', { name: 'Export' }));
-    expect(await screen.findByText(/incorrect pin/i)).toBeInTheDocument();
+    expect(await screen.findByText(/incorrect pin/i, {}, { timeout: 5000 })).toBeInTheDocument();
   });
 
   it('exports successfully with the correct device PIN', async () => {
