@@ -85,6 +85,27 @@ describe('App', () => {
     await waitFor(() => expect(screen.queryByText('delete me')).not.toBeInTheDocument());
   });
 
+  it('edits a captured note and shows the updated text', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+    await user.type(screen.getByPlaceholderText('Confirm PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Set PIN' }));
+
+    await user.type(await screen.findByPlaceholderText('Jot a thought...'), 'buy milk');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('buy milk');
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('buy milk');
+    await user.clear(input);
+    await user.type(input, 'buy oat milk');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await screen.findByText('buy oat milk')).toBeInTheDocument();
+    expect(screen.queryByText('buy milk')).not.toBeInTheDocument();
+  });
+
   it('gives ExportSettings the full entry list even when a filter hides an entry from the visible timeline', async () => {
     let capturedBlob: Blob | null = null;
     URL.createObjectURL = vi.fn((blob: Blob) => {

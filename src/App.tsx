@@ -11,7 +11,7 @@ import { ReminderSettings } from './components/ReminderSettings';
 import { isPinConfigured } from './auth/pin';
 import { getOrCreateDeviceId } from './storage/db';
 import { getAllEntries, saveEntry, deleteEntry } from './storage/entryRepository';
-import { createNote, createEvent, filterEntries, Entry } from './models/entry';
+import { createNote, createEvent, filterEntries, updateEntry, Entry } from './models/entry';
 import { ConflictPair } from './sync/merge';
 import { scheduleEventReminders } from './notifications/reminders';
 
@@ -94,6 +94,14 @@ export default function App() {
     setEntries((prev) => (tombstoned ? prev.map((e) => (e.id === id ? tombstoned : e)) : prev));
   }
 
+  async function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
+    const existing = entries.find((e) => e.id === id);
+    if (!existing) return;
+    const updated = updateEntry(existing, rawText, deviceId, eventDate, eventTime);
+    await saveEntry(key, updated);
+    setEntries((prev) => prev.map((e) => (e.id === id ? updated : e)));
+  }
+
   return (
     <div className="app">
       <header>
@@ -114,6 +122,7 @@ export default function App() {
         onAddNote={handleAddNote}
         onAddEvent={handleAddEvent}
         onDelete={handleDelete}
+        onEdit={handleEdit}
       />
       {conflicts.length > 0 && <ConflictResolver conflicts={conflicts} onResolve={handleResolve} />}
       {showSync && (
