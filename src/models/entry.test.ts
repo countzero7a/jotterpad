@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseTags, createNote, createEvent, markDeleted, filterEntries } from './entry';
+import { parseTags, createNote, createEvent, markDeleted, filterEntries, updateEntry } from './entry';
 
 describe('parseTags', () => {
   it('extracts hashtags and lowercases them', () => {
@@ -82,5 +82,32 @@ describe('filterEntries', () => {
 
   it('returns everything when query and tags are empty', () => {
     expect(filterEntries(entries, '', [])).toHaveLength(3);
+  });
+});
+
+describe('updateEntry', () => {
+  it('updates text and tags while bumping modifiedAt and deviceId', () => {
+    const original = createNote('old text #old', 'device-1');
+    const updated = updateEntry(original, 'new text #new', 'device-2');
+    expect(updated.text).toBe('new text #new');
+    expect(updated.tags).toEqual(['new']);
+    expect(updated.deviceId).toBe('device-2');
+    expect(updated.modifiedAt).toBeGreaterThanOrEqual(original.modifiedAt);
+    expect(updated.id).toBe(original.id);
+    expect(updated.createdAt).toBe(original.createdAt);
+  });
+
+  it('updates eventDate/eventTime for an event', () => {
+    const original = createEvent('dentist', '2026-08-01', '09:00', 'device-1');
+    const updated = updateEntry(original, 'dentist checkup', 'device-1', '2026-08-02', '10:00');
+    expect(updated.eventDate).toBe('2026-08-02');
+    expect(updated.eventTime).toBe('10:00');
+  });
+
+  it('does not add eventDate/eventTime to a note', () => {
+    const original = createNote('just a note', 'device-1');
+    const updated = updateEntry(original, 'still a note', 'device-1', '2026-08-02', '10:00');
+    expect(updated.eventDate).toBeUndefined();
+    expect(updated.eventTime).toBeUndefined();
   });
 });

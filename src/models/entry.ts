@@ -65,6 +65,22 @@ export function markDeleted(entry: Entry): Entry {
   return { ...entry, deleted: true, deletedAt: Date.now(), modifiedAt: Date.now() };
 }
 
+export function updateEntry(
+  entry: Entry,
+  rawText: string,
+  deviceId: string,
+  eventDate?: string,
+  eventTime?: string
+): Entry {
+  const { text, tags } = parseTags(rawText);
+  const updated: Entry = { ...entry, text, tags, modifiedAt: Date.now(), deviceId };
+  if (entry.type === 'event') {
+    updated.eventDate = eventDate ?? entry.eventDate;
+    updated.eventTime = eventTime;
+  }
+  return updated;
+}
+
 export function filterEntries(entries: Entry[], query: string, selectedTags: string[]): Entry[] {
   const normalizedQuery = query.trim().toLowerCase();
   return entries.filter((entry) => {
