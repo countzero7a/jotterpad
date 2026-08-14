@@ -25,27 +25,44 @@ export default function App() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [showSync, setShowSync] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
 
   useEffect(() => {
-    isPinConfigured().then(setPinConfigured);
-    getOrCreateDeviceId().then(setDeviceId);
+    isPinConfigured()
+      .then(setPinConfigured)
+      .catch(() => setInitError('Could not check whether a PIN is set up. Please reload the app.'));
+    getOrCreateDeviceId()
+      .then(setDeviceId)
+      .catch(() => setInitError('Could not initialize this device. Please reload the app.'));
   }, []);
 
   useEffect(() => {
     if (!cryptoKey) return;
-    getAllEntries(cryptoKey).then((loaded) => {
-      setEntries(loaded);
-      scheduleEventReminders(loaded);
-    });
+    getAllEntries(cryptoKey)
+      .then((loaded) => {
+        setEntries(loaded);
+      })
+      .catch(() =>
+        setInitError(
+          'Could not load your saved entries. Your data is still on this device untouched — please reload the app before adding anything new.'
+        )
+      );
   }, [cryptoKey]);
 
+  useEffect(() => {
+    scheduleEventReminders(entries);
+  }, [entries]);
+
+  if (initError) return <p role="alert">{initError}</p>;
   if (pinConfigured === null) return null;
   if (!cryptoKey) {
     return <LockScreen mode={pinConfigured ? 'unlock' : 'setup'} onUnlock={setCryptoKey} />;
   }
+  const key = cryptoKey;
 
-  const visible = filterEntries(entries.filter((e) => !e.deleted), query, selectedTags);
-  const allTags = Array.from(new Set(entries.flatMap((e) => e.tags)));
+  const nonDeleted = entries.filter((e) => !e.deleted);
+  const visible = filterEntries(nonDeleted, query, selectedTags);
+  const allTags = Array.from(new Set(nonDeleted.flatMap((e) => e.tags)));
 
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
     setEntries(merged);
@@ -53,25 +70,28 @@ export default function App() {
   }
 
   async function handleResolve(entry: Entry) {
-    await saveEntry(cryptoKey!, entry);
-    setEntries((prev) => [...prev.filter((e) => e.id !== entry.id), entry]);
+    const resolved = { ...entry, modifiedAt: Date.now() };
+    await saveEntry(key, resolved);
+    setEntries((prev) => [...prev.filter((e) => e.id !== resolved.id), resolved]);
     setConflicts((prev) => prev.slice(1));
   }
 
   async function handleAddNote(rawText: string) {
     const entry = createNote(rawText, deviceId);
-    await saveEntry(cryptoKey!, entry);
+    await saveEntry(key, entry);
     setEntries((prev) => [...prev, entry]);
   }
 
   async function handleAddEvent(rawText: string, eventDate: string, eventTime: string) {
     const entry = createEvent(rawText, eventDate, eventTime, deviceId);
-    await saveEntry(cryptoKey!, entry);
+    await saveEntry(key, entry);
     setEntries((prev) => [...prev, entry]);
   }
 
   async function handleDelete(id: string) {
-    setEntries(await deleteEntry(cryptoKey!, entries, id));
+    const updated = await deleteEntry(key, entries, id);
+    const tombstoned = updated.find((e) => e.id === id);
+    setEntries((prev) => (tombstoned ? prev.map((e) => (e.id === id ? tombstoned : e)) : prev));
   }
 
   return (
