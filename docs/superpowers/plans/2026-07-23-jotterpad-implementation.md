@@ -3465,6 +3465,1096 @@ git commit -m "feat: add visual styling for the chat-style layout"
 
 ---
 
+## Task 17: Fix Sync Watermark Design (Critical Data-Loss Bug)
+
+**Added after the final whole-branch review**: Task 11's sync design used a single `lastSyncAt` timestamp for two different purposes — the merge/conflict cutoff (correctly bumped when receiving a bundle) AND the filter for what's new to send (incorrectly using that same, just-bumped value). In the normal flow (scan first, then show — see Task 11's manual verification steps), a device that just received a bundle has already advanced its watermark before computing its own outgoing bundle, so `selectChangedSince` excludes everything, including changes never yet sent to the peer. Those changes are then **permanently** lost — the entry's `modifiedAt` never rises above the now-advanced watermark, so it stays excluded forever. This is a plan-level defect (Task 11 itself specified this design), not sloppy implementation.
+
+**The fix**: track two independent watermarks. `lastSyncAt` (existing) stays purely the merge/conflict cutoff, bumped whenever a bundle is received. A new `lastSentAt` tracks what has actually been shown to the peer, bumped only when the user confirms they're done displaying a QR sequence — independent of whatever receiving may have happened before or after in the same session.
+
+**Files:**
+- Modify: `src/storage/db.ts`
+- Modify: `src/sync/syncActions.ts`
+- Modify: `src/sync/syncActions.test.ts`
+- Modify: `src/components/SyncScreen.tsx`
+- Create: `src/sync/syncProtocol.test.ts`
+
+**Interfaces:**
+- Consumes: `getMeta`/`setMeta` (Task 4); `selectChangedSince`, `mergeEntries` (Task 7); `chunkPayload`, `parseFrame`, `FrameReassembler` (Task 8).
+- Produces: `getLastSentAt(): Promise<number>`, `setLastSentAt(timestamp: number): Promise<void>` (in `db.ts`); `prepareOutgoingBundle` now reads `lastSentAt` instead of `lastSyncAt`; new `markBundleSent(): Promise<void>` in `syncActions.ts`, called by `SyncScreen` once the user confirms a "show" pass is done.
+
+- [ ] **Step 1: Write the failing tests for the new watermark functions**
+
+```ts
+// append to src/storage/entryRepository.test.ts is wrong file — add to a new describe block in src/storage/db.test.ts if it exists, otherwise inline here as part of Step 2's file. Since db.ts has no dedicated test file yet, create one:
+```
+
+```ts
+// src/storage/db.test.ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import 'fake-indexeddb/auto';
+import { getDb, getLastSentAt, setLastSentAt, getLastSyncAt, setLastSyncAt } from './db';
+
+async function resetDb() {
+  const db = await getDb();
+  await db.clear('meta');
+}
+
+describe('db watermarks', () => {
+  beforeEach(async () => {
+    await resetDb();
+  });
+
+  it('defaults lastSentAt to 0 before it is ever set', async () => {
+    expect(await getLastSentAt()).toBe(0);
+  });
+
+  it('persists and retrieves lastSentAt', async () => {
+    await setLastSentAt(12345);
+    expect(await getLastSentAt()).toBe(12345);
+  });
+
+  it('keeps lastSentAt independent from lastSyncAt', async () => {
+    await setLastSyncAt(1000);
+    await setLastSentAt(2000);
+    expect(await getLastSyncAt()).toBe(1000);
+    expect(await getLastSentAt()).toBe(2000);
+  });
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npm test -- db.test`
+Expected: FAIL — `getLastSentAt`/`setLastSentAt` do not exist yet.
+
+- [ ] **Step 3: Add the new watermark functions to `src/storage/db.ts`**
+
+Add these two functions, following the exact pattern of the existing `getLastSyncAt`/`setLastSyncAt`:
+
+```ts
+export async function getLastSentAt(): Promise<number> {
+  const raw = await getMeta('lastSentAt');
+  return raw ? Number(raw) : 0;
+}
+
+export async function setLastSentAt(timestamp: number): Promise<void> {
+  await setMeta('lastSentAt', String(timestamp));
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npm test -- db.test`
+Expected: PASS (3 tests)
+
+- [ ] **Step 5: Update `src/sync/syncActions.ts`**
+
+Change `prepareOutgoingBundle` to use the new send watermark instead of the sync (receive) watermark, and add `markBundleSent`:
+
+```ts
+import { Entry } from '../models/entry';
+import { mergeEntries, ConflictPair, selectChangedSince } from './merge';
+import { chunkPayload } from './qrProtocol';
+import { saveEntry } from '../storage/entryRepository';
+import { getLastSyncAt, setLastSyncAt, getLastSentAt, setLastSentAt } from '../storage/db';
+
+export interface SyncBundle {
+  senderDeviceId: string;
+  entries: Entry[];
+}
+
+export async function prepareOutgoingBundle(deviceId: string, entries: Entry[]): Promise<string[]> {
+  const lastSentAt = await getLastSentAt();
+  const changed = selectChangedSince(entries, lastSentAt);
+  const bundle: SyncBundle = { senderDeviceId: deviceId, entries: changed };
+  return chunkPayload(bundle, crypto.randomUUID());
+}
+
+export async function markBundleSent(): Promise<void> {
+  await setLastSentAt(Date.now());
+}
+
+export async function applyScannedBundle(
+  cryptoKey: CryptoKey,
+  localEntries: Entry[],
+  bundle: SyncBundle
+): Promise<{ merged: Entry[]; conflicts: ConflictPair[] }> {
+  const lastSyncAt = await getLastSyncAt();
+  const { merged, conflicts } = mergeEntries(localEntries, bundle.entries, lastSyncAt);
+  for (const entry of merged) {
+    await saveEntry(cryptoKey, entry);
+  }
+  await setLastSyncAt(Date.now());
+  return { merged, conflicts };
+}
+```
+
+(`applyScannedBundle` itself is unchanged — only its imports gain the two new functions, which `markBundleSent` uses.)
+
+- [ ] **Step 6: Update `src/sync/syncActions.test.ts`**
+
+The existing test `'prepareOutgoingBundle only includes entries changed since the last sync'` currently seeds `setLastSyncAt(1000)` and expects that to gate the outgoing bundle. Change it to seed `setLastSentAt(1000)` instead (import `setLastSentAt` from `../storage/db` alongside the existing `setLastSyncAt` import), since outgoing filtering is now based on the send watermark, not the sync (receive) watermark. Add one new test:
+
+```ts
+it('markBundleSent advances lastSentAt, and a subsequent call reflects it', async () => {
+  const { setLastSentAt: seedSentAt } = await import('../storage/db');
+  await seedSentAt(0);
+  const before = Date.now();
+  await markBundleSent();
+  const { getLastSentAt } = await import('../storage/db');
+  expect(await getLastSentAt()).toBeGreaterThanOrEqual(before);
+});
+```
+
+Add `markBundleSent` to the existing `import { prepareOutgoingBundle, applyScannedBundle, SyncBundle } from './syncActions';` line.
+
+- [ ] **Step 7: Run tests to verify they pass**
+
+Run: `npm test -- syncActions`
+Expected: PASS (5 tests: the original 4, with the first updated to seed `lastSentAt`, plus this new one)
+
+- [ ] **Step 8: Write the protocol-level two-device round-trip test**
+
+This is the test the whole-branch review identified as missing — it proves the two-pass exchange preserves data across sessions, using only the pure functions (`selectChangedSince`, `chunkPayload`, `parseFrame`, `FrameReassembler`, `mergeEntries`) to model two independent devices' local state directly, with no camera, no real storage, and no UI involved:
+
+```ts
+// src/sync/syncProtocol.test.ts
+import { describe, it, expect } from 'vitest';
+import { selectChangedSince, mergeEntries } from './merge';
+import { chunkPayload, parseFrame, FrameReassembler } from './qrProtocol';
+import { createNote, Entry } from '../models/entry';
+
+interface VirtualDevice {
+  id: string;
+  entries: Entry[];
+  lastSyncAt: number;
+  lastSentAt: number;
+}
+
+function show(device: VirtualDevice): string[] {
+  const changed = selectChangedSince(device.entries, device.lastSentAt);
+  const bundle = { senderDeviceId: device.id, entries: changed };
+  return chunkPayload(bundle, crypto.randomUUID());
+}
+
+function markSent(device: VirtualDevice): void {
+  device.lastSentAt = Date.now();
+}
+
+function scan(device: VirtualDevice, frames: string[]): void {
+  const reassembler = new FrameReassembler();
+  frames.forEach((f) => reassembler.addFrame(parseFrame(f)));
+  const bundle = reassembler.getResult<{ senderDeviceId: string; entries: Entry[] }>();
+  const { merged } = mergeEntries(device.entries, bundle.entries, device.lastSyncAt);
+  device.entries = merged;
+  device.lastSyncAt = Date.now();
+}
+
+describe('two-device sync protocol round trip', () => {
+  it('preserves both sides notes through a scan-then-show session', () => {
+    const a: VirtualDevice = {
+      id: 'device-a',
+      entries: [createNote('A note 1', 'device-a'), createNote('A note 2', 'device-a')],
+      lastSyncAt: 0,
+      lastSentAt: 0,
+    };
+    const b: VirtualDevice = {
+      id: 'device-b',
+      entries: [createNote('B note 1', 'device-b')],
+      lastSyncAt: 0,
+      lastSentAt: 0,
+    };
+
+    // Session 1: A shows, B scans (receives A's notes) — B's own note is untouched by this.
+    const aFrames = show(a);
+    markSent(a);
+    scan(b, aFrames);
+
+    // Then, in the SAME session, B shows its own changes. This is the exact scenario that
+    // was broken: B just bumped its lastSyncAt during the scan above. If prepareOutgoingBundle
+    // had used lastSyncAt (the old, buggy behavior), B's own note would now be excluded.
+    const bFrames = show(b);
+    markSent(b);
+    scan(a, bFrames);
+
+    const aTexts = a.entries.map((e) => e.text).sort();
+    const bTexts = b.entries.map((e) => e.text).sort();
+    expect(aTexts).toEqual(['A note 1', 'A note 2', 'B note 1']);
+    expect(bTexts).toEqual(['A note 1', 'A note 2', 'B note 1']);
+  });
+
+  it('does not resend already-sent entries in a later session, but does send new ones', () => {
+    const a: VirtualDevice = {
+      id: 'device-a',
+      entries: [createNote('A note 1', 'device-a')],
+      lastSyncAt: 0,
+      lastSentAt: 0,
+    };
+    const b: VirtualDevice = { id: 'device-b', entries: [], lastSyncAt: 0, lastSentAt: 0 };
+
+    // Session 1: full exchange.
+    scan(b, show(a));
+    markSent(a);
+    scan(a, show(b));
+    markSent(b);
+
+    // Session 2: nothing new — both outgoing bundles should be empty.
+    const aFramesEmpty = show(a);
+    const bFramesEmpty = show(b);
+    const reassemblerA = new FrameReassembler();
+    aFramesEmpty.forEach((f) => reassemblerA.addFrame(parseFrame(f)));
+    const reassemblerB = new FrameReassembler();
+    bFramesEmpty.forEach((f) => reassemblerB.addFrame(parseFrame(f)));
+    expect(reassemblerA.getResult<{ entries: Entry[] }>().entries).toEqual([]);
+    expect(reassemblerB.getResult<{ entries: Entry[] }>().entries).toEqual([]);
+
+    // Session 3: A adds a new note. Only the new note should go out.
+    a.entries.push(createNote('A note 2', 'device-a'));
+    const aFramesNew = show(a);
+    const reassemblerA2 = new FrameReassembler();
+    aFramesNew.forEach((f) => reassemblerA2.addFrame(parseFrame(f)));
+    const sent = reassemblerA2.getResult<{ entries: Entry[] }>().entries;
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toBe('A note 2');
+  });
+});
+```
+
+- [ ] **Step 9: Run tests to verify they pass**
+
+Run: `npm test -- syncProtocol`
+Expected: PASS (2 tests) — the first test specifically reproduces the exact bug scenario the whole-branch review found and would have FAILED against the pre-fix `prepareOutgoingBundle` (which used `lastSyncAt`), since `b`'s own note would have been excluded from `bFrames` after `scan(b, aFrames)` bumped `b.lastSyncAt`.
+
+- [ ] **Step 10: Wire `markBundleSent` into `SyncScreen`**
+
+In `src/components/SyncScreen.tsx`, import `markBundleSent` alongside the existing `prepareOutgoingBundle`/`applyScannedBundle` import, and change the `QrDisplay`'s `onDone` handler so it calls `markBundleSent()` before returning to the menu:
+
+```tsx
+if (step === 'showing') {
+  return (
+    <QrDisplay
+      frames={frames}
+      onDone={() => {
+        markBundleSent().then(() => setStep('menu'));
+      }}
+    />
+  );
+}
+```
+
+- [ ] **Step 11: Run the full suite, typecheck, and build**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run build`
+Expected: all pass, zero type errors, build succeeds.
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add src/storage/db.ts src/storage/db.test.ts src/sync/syncActions.ts src/sync/syncActions.test.ts src/sync/syncProtocol.test.ts src/components/SyncScreen.tsx
+git commit -m "fix: separate send/receive sync watermarks to stop permanent data loss on the second sync pass"
+```
+
+---
+
+## Task 18: PIN Setup Race Condition and Missing In-Flight Guards
+
+**Added after the final whole-branch review**: `setupPin` writes `salt` then `verifier` as two separate, non-transactional calls. `LockScreen`'s submit button has no disabled/in-flight state, and PBKDF2 takes 1-3 seconds — exactly the condition that invites a double-tap. Two concurrent `setupPin()` calls can interleave their writes (e.g. salt from call 2, verifier from call 1), producing a stored salt/verifier pair that doesn't correspond to any single derived key — permanently bricking the device, since there is no recovery mechanism.
+
+**Files:**
+- Modify: `src/storage/db.ts`
+- Modify: `src/auth/pin.ts`
+- Modify: `src/auth/pin.test.ts`
+- Modify: `src/components/LockScreen.tsx`
+- Modify: `src/components/LockScreen.test.tsx`
+
+**Interfaces:**
+- Consumes: `getDb` (Task 4).
+- Produces: no new exported signatures; `setupPin`'s external behavior (`Promise<CryptoKey>`) is unchanged, only its internal write becomes atomic. `LockScreen` gains internal `submitting` state, no prop changes.
+
+- [ ] **Step 1: Write the failing test proving the current race**
+
+```ts
+// append to src/auth/pin.test.ts
+it('does not produce a mismatched salt/verifier pair when setupPin is called concurrently with different pins', async () => {
+  const [keyA] = await Promise.all([setupPin('1111'), setupPin('2222')]);
+  const unlockedWithA = await unlockWithPin('1111');
+  const unlockedWithB = await unlockWithPin('2222');
+  // Exactly one of the two PINs used in the race must actually unlock — whichever call's
+  // write "won" — and the winning key must be usable for real encryption, not just returned.
+  const oneWorks = (unlockedWithA !== null) !== (unlockedWithB !== null);
+  expect(oneWorks).toBe(true);
+  const winningKey = unlockedWithA ?? unlockedWithB;
+  expect(winningKey).not.toBeNull();
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails (or passes flakily)**
+
+Run: `npm test -- pin -t "does not produce a mismatched"`
+Expected: this test is non-deterministic against the current code — sometimes it passes by luck, sometimes both unlocks fail (proving corruption) because the salt and verifier came from different calls. Run it 5 times in a row (`npm test -- pin -t "does not produce a mismatched"` repeated) and confirm at least one run shows `oneWorks` as `false` or `winningKey` as `null`, demonstrating the race is real before proceeding.
+
+- [ ] **Step 3: Add a transactional write helper to `src/storage/db.ts`**
+
+```ts
+export async function setMetaEntries(entries: Array<[string, string]>): Promise<void> {
+  const db = await getDb();
+  const tx = db.transaction('meta', 'readwrite');
+  await Promise.all(entries.map(([key, value]) => tx.store.put(value, key)));
+  await tx.done;
+}
+```
+
+- [ ] **Step 4: Update `setupPin` in `src/auth/pin.ts` to write atomically**
+
+```ts
+import { deriveKey, encrypt, decrypt } from '../crypto/crypto';
+import { getMeta, setMetaEntries } from '../storage/db';
+
+const VERIFIER_PLAINTEXT = 'jotterpad-verify';
+
+export async function isPinConfigured(): Promise<boolean> {
+  const salt = await getMeta('salt');
+  const verifier = await getMeta('verifier');
+  return salt !== undefined && verifier !== undefined;
+}
+
+export async function setupPin(pin: string): Promise<CryptoKey> {
+  const { key, salt } = await deriveKey(pin);
+  const verifier = await encrypt(key, VERIFIER_PLAINTEXT);
+  await setMetaEntries([
+    ['salt', salt],
+    ['verifier', verifier],
+  ]);
+  return key;
+}
+
+export async function unlockWithPin(pin: string): Promise<CryptoKey | null> {
+  const salt = await getMeta('salt');
+  const verifier = await getMeta('verifier');
+  if (!salt || !verifier) return null;
+  const { key } = await deriveKey(pin, salt);
+  try {
+    const decrypted = await decrypt(key, verifier);
+    return decrypted === VERIFIER_PLAINTEXT ? key : null;
+  } catch {
+    return null;
+  }
+}
+```
+
+`setMeta`(singular) in `db.ts` stays as-is for all other call sites — this only changes how `pin.ts` writes its two keys together.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `npm test -- pin`
+Expected: PASS. Run the concurrent-setup test 10 times in a row (`for i in {1..10}; do npm test -- pin -t "does not produce a mismatched" || break; done`) to confirm it's now reliably passing, not just lucky.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/storage/db.ts src/auth/pin.ts src/auth/pin.test.ts
+git commit -m "fix: write PIN salt and verifier in one transaction to prevent race-corrupted setup"
+```
+
+- [ ] **Step 7: Write the failing test for LockScreen's in-flight guard**
+
+```tsx
+// append to src/components/LockScreen.test.tsx
+it('disables the submit button while a PIN operation is in flight', async () => {
+  const user = userEvent.setup();
+  render(<LockScreen mode="setup" onUnlock={vi.fn()} />);
+  await user.type(screen.getByPlaceholderText('PIN'), '1234');
+  await user.type(screen.getByPlaceholderText('Confirm PIN'), '1234');
+  const button = screen.getByRole('button', { name: 'Set PIN' });
+  await user.click(button);
+  expect(button).toBeDisabled();
+});
+```
+
+- [ ] **Step 8: Run tests to verify they fail**
+
+Run: `npm test -- LockScreen -t "disables the submit button"`
+Expected: FAIL — the button has no `disabled` attribute yet.
+
+- [ ] **Step 9: Add a `submitting` guard to `src/components/LockScreen.tsx`**
+
+Add a `const [submitting, setSubmitting] = useState(false);` alongside the existing state. At the top of `handleSubmit`, add `if (submitting) return;` then `setSubmitting(true);` before the mode branches. In the `finally` (add a `finally` block to the existing try/catch, or set it at the end of both success paths and in the catch), set `setSubmitting(false)`. Add `disabled={submitting}` to the submit `<button>`.
+
+```tsx
+async function handleSubmit(e: FormEvent) {
+  e.preventDefault();
+  if (submitting) return;
+  setError('');
+  setSubmitting(true);
+  try {
+    if (mode === 'setup') {
+      if (pin.length < 4) {
+        setError('PIN must be at least 4 digits.');
+        return;
+      }
+      if (pin !== confirmPin) {
+        setError('PINs do not match.');
+        return;
+      }
+      const key = await setupPin(pin);
+      onUnlock(key);
+    } else {
+      const key = await unlockWithPin(pin);
+      if (!key) {
+        setError('Incorrect PIN.');
+        return;
+      }
+      onUnlock(key);
+    }
+  } catch {
+    setError('Something went wrong. Please try again.');
+  } finally {
+    setSubmitting(false);
+  }
+}
+```
+
+And on the submit button: `<button type="submit" disabled={submitting}>{mode === 'setup' ? 'Set PIN' : 'Unlock'}</button>`.
+
+- [ ] **Step 10: Run tests to verify they pass**
+
+Run: `npm test -- LockScreen`
+Expected: PASS (7 tests: the original 6 plus this one)
+
+- [ ] **Step 11: Run the full suite, typecheck, and build**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run build`
+Expected: all pass, zero type errors, build succeeds.
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add src/components/LockScreen.tsx src/components/LockScreen.test.tsx
+git commit -m "fix: disable PIN submit button while a request is in flight to prevent double-submit corruption"
+```
+
+---
+
+## Task 19: Stale Edit State and Lost Conflicts on Reload
+
+**Added after the final whole-branch review**: two related state-freshness bugs. First, `EntryItem`'s edit form seeds its local state once from `entry` at mount; since React reuses the same component instance keyed by `entry.id`, if a sync/merge replaces the entry's content while the item is NOT being edited, clicking Edit afterward shows stale (pre-sync) text, and saving it clobbers the merged content with a fresh `modifiedAt`, silently re-discarding the remote edit. Second, pending conflicts live only in `App`'s React state — closing the tab with an unresolved conflict discards it permanently, since the watermark has already advanced and the local "winner" is what's persisted.
+
+**Files:**
+- Modify: `src/components/EntryItem.tsx`
+- Modify: `src/components/EntryItem.test.tsx`
+- Modify: `src/storage/db.ts`
+- Modify: `src/App.tsx`
+- Modify: `src/App.test.tsx`
+- Modify: `src/index.css`
+
+**Interfaces:**
+- Consumes: `Entry` (Task 3); `getMeta`/`setMeta` (Task 4); `ConflictPair` (Task 7).
+- Produces: `getPendingConflicts(): Promise<ConflictPair[]>`, `setPendingConflicts(conflicts: ConflictPair[]): Promise<void>` (in `db.ts`).
+
+- [ ] **Step 1: Write the failing test for stale edit state**
+
+```tsx
+// append to src/components/EntryItem.test.tsx
+it('shows the latest entry text when re-entering edit mode after the entry prop changes', async () => {
+  const user = userEvent.setup();
+  const entry = createNote('milk', 'device-1');
+  const { rerender } = render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+
+  const updatedEntry = { ...entry, text: 'oat milk (from other device)', modifiedAt: entry.modifiedAt + 1 };
+  rerender(<EntryItem entry={updatedEntry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+
+  await user.click(screen.getByRole('button', { name: 'Edit' }));
+  expect(screen.getByDisplayValue('oat milk (from other device)')).toBeInTheDocument();
+  expect(screen.queryByDisplayValue('milk')).not.toBeInTheDocument();
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npm test -- EntryItem -t "shows the latest entry text"`
+Expected: FAIL — the edit form still shows `milk`, the value captured at mount.
+
+- [ ] **Step 3: Fix `src/components/EntryItem.tsx` to seed edit state fresh on entering edit mode**
+
+Replace the `useState` initializers with state that resets when entering edit mode, using an effect keyed on `editing` and `entry`:
+
+```tsx
+import { useEffect, useState } from 'react';
+import { Entry } from '../models/entry';
+
+interface EntryItemProps {
+  entry: Entry;
+  onDelete: (id: string) => void;
+  onEdit: (id: string, rawText: string, eventDate?: string, eventTime?: string) => void;
+}
+
+export function EntryItem({ entry, onDelete, onEdit }: EntryItemProps) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(entry.text);
+  const [eventDate, setEventDate] = useState(entry.eventDate ?? '');
+  const [eventTime, setEventTime] = useState(entry.eventTime ?? '');
+
+  useEffect(() => {
+    if (editing) {
+      setText(entry.text);
+      setEventDate(entry.eventDate ?? '');
+      setEventTime(entry.eventTime ?? '');
+    }
+  }, [editing, entry]);
+
+  function handleSave() {
+    if (!text.trim()) return;
+    if (entry.type === 'event' && !eventDate) return;
+    onEdit(
+      entry.id,
+      text,
+      entry.type === 'event' ? eventDate : undefined,
+      entry.type === 'event' ? eventTime : undefined
+    );
+    setEditing(false);
+  }
+
+  function handleCancel() {
+    setText(entry.text);
+    setEventDate(entry.eventDate ?? '');
+    setEventTime(entry.eventTime ?? '');
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <div className="entry entry-editing" data-type={entry.type}>
+        <input value={text} onChange={(e) => setText(e.target.value)} />
+        {entry.type === 'event' && (
+          <>
+            <input type="date" value={eventDate} onChange={(e) => setEventDate(e.target.value)} />
+            <input type="time" value={eventTime} onChange={(e) => setEventTime(e.target.value)} />
+          </>
+        )}
+        <button onClick={handleSave}>Save</button>
+        <button onClick={handleCancel}>Cancel</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="entry" data-type={entry.type}>
+      <span>{entry.type === 'event' ? '📅' : '📝'}</span>
+      <span>{entry.text}</span>
+      {entry.type === 'event' && (
+        <span>
+          {entry.eventDate} {entry.eventTime}
+        </span>
+      )}
+      {entry.tags.map((tag) => (
+        <span key={tag} className="tag">
+          #{tag}
+        </span>
+      ))}
+      <button onClick={() => setEditing(true)}>Edit</button>
+      <button onClick={() => onDelete(entry.id)}>Delete</button>
+    </div>
+  );
+}
+```
+
+(This preserves the empty-date guard added in Task 15's fix round — it's included above so the file stays complete and correct.)
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npm test -- EntryItem`
+Expected: PASS (7 tests: the original 6 plus this one)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/components/EntryItem.tsx src/components/EntryItem.test.tsx
+git commit -m "fix: refresh EntryItem's edit form from the latest entry when entering edit mode"
+```
+
+- [ ] **Step 6: Write the failing tests for persisted pending conflicts**
+
+```ts
+// append to src/storage/db.test.ts
+import { getPendingConflicts, setPendingConflicts } from './db';
+import { createNote } from '../models/entry';
+
+describe('pending conflicts', () => {
+  beforeEach(async () => {
+    await resetDb();
+  });
+
+  it('defaults to an empty array before any conflicts are stored', async () => {
+    expect(await getPendingConflicts()).toEqual([]);
+  });
+
+  it('persists and retrieves pending conflicts', async () => {
+    const local = createNote('local version', 'device-1');
+    const remote = createNote('remote version', 'device-2');
+    await setPendingConflicts([{ local, remote }]);
+    const loaded = await getPendingConflicts();
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].local.text).toBe('local version');
+    expect(loaded[0].remote.text).toBe('remote version');
+  });
+});
+```
+
+- [ ] **Step 7: Run tests to verify they fail**
+
+Run: `npm test -- db.test`
+Expected: FAIL — `getPendingConflicts`/`setPendingConflicts` do not exist yet.
+
+- [ ] **Step 8: Add persisted-conflict storage to `src/storage/db.ts`**
+
+```ts
+import { ConflictPair } from '../sync/merge';
+
+export async function getPendingConflicts(): Promise<ConflictPair[]> {
+  const raw = await getMeta('pendingConflicts');
+  return raw ? (JSON.parse(raw) as ConflictPair[]) : [];
+}
+
+export async function setPendingConflicts(conflicts: ConflictPair[]): Promise<void> {
+  await setMeta('pendingConflicts', JSON.stringify(conflicts));
+}
+```
+
+Add this import at the top of `db.ts` alongside the existing ones. (Conflict entries are the same shape already persisted elsewhere in encrypted form via `saveEntry`; storing the pending conflict pair itself in plaintext meta is acceptable here since it duplicates already-locally-known entry content rather than exposing anything not already on-device — the entries themselves remain individually encrypted in the `entries` store regardless.)
+
+- [ ] **Step 9: Run tests to verify they pass**
+
+Run: `npm test -- db.test`
+Expected: PASS (5 tests: the original 3 plus these 2)
+
+- [ ] **Step 10: Wire persisted conflicts into `App.tsx`, and fix render order**
+
+In `src/App.tsx`:
+1. Import `getPendingConflicts`, `setPendingConflicts` from `./storage/db` alongside the existing imports.
+2. On mount (in the same effect that loads `isPinConfigured`/`getOrCreateDeviceId`, or a new one), load persisted conflicts: `getPendingConflicts().then(setConflicts).catch(() => {})`.
+3. In `handleMerged`, after computing the new conflicts array, persist it: `setConflicts((prev) => { const next = [...prev, ...newConflicts]; setPendingConflicts(next); return next; });`.
+4. In `handleResolve`, after removing the resolved conflict, persist the remainder: `setConflicts((prev) => { const next = prev.slice(1); setPendingConflicts(next); return next; });`.
+5. Move the `{conflicts.length > 0 && <ConflictResolver ... />}` block to render AFTER (below, later in JSX) the `SyncScreen` and `.settings` blocks, so it visually sits on top given they're all `position: fixed` — the last fixed-position sibling in DOM order paints on top when z-index is equal.
+
+- [ ] **Step 11: Write the failing test for conflict persistence surviving a reload**
+
+```tsx
+// append to src/App.test.tsx
+it('shows a pending conflict that was persisted from a previous session', async () => {
+  const { setPendingConflicts } = await import('./storage/db');
+  const { createNote } = await import('./models/entry');
+  await setupPin('1234');
+  const local = createNote('local version', 'device-1');
+  const remote = createNote('remote version', 'device-2');
+  await setPendingConflicts([{ local, remote }]);
+
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+  await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+  expect(await screen.findByText(/local version/)).toBeInTheDocument();
+  expect(screen.getByText(/remote version/)).toBeInTheDocument();
+});
+```
+
+Add `import { setupPin } from './auth/pin';` to the top of `App.test.tsx` if not already present (check the existing imports first — it's likely already imported for other tests).
+
+- [ ] **Step 12: Run tests to verify they pass**
+
+Run: `npm test -- App`
+Expected: PASS (9 tests: the existing 8 plus this one)
+
+- [ ] **Step 13: Add z-index to `src/index.css` so the conflict resolver reliably paints above other overlays**
+
+In `src/index.css`, split the shared rule so `.conflict-resolver` gets a higher stacking context:
+
+```css
+.sync-screen,
+.settings {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.conflict-resolver {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  z-index: 10;
+}
+```
+
+- [ ] **Step 14: Run the full suite, typecheck, and build**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run build`
+Expected: all pass, zero type errors, build succeeds.
+
+- [ ] **Step 15: Commit**
+
+```bash
+git add src/storage/db.ts src/storage/db.test.ts src/App.tsx src/App.test.tsx src/index.css
+git commit -m "fix: persist pending conflicts across reloads and ensure the conflict resolver renders on top"
+```
+
+---
+
+## Task 20: Validate Untrusted Sync and Backup Data
+
+**Added after the final whole-branch review**: scanned QR bundles and restored backup files are cast (`as SyncBundle`, `as Entry[]`) with no runtime validation, and neither the scan handler nor the import handler wraps the parse-and-merge sequence in a way that gives the user a way out if the data is malformed. A corrupted or truncated scan currently leaves the user stuck on a dead scanner screen with no Cancel button.
+
+**Files:**
+- Create: `src/sync/validate.ts`
+- Create: `src/sync/validate.test.ts`
+- Modify: `src/components/SyncScreen.tsx`
+- Modify: `src/components/QrScanner.tsx`
+- Modify: `src/components/ImportBackup.tsx`
+- Modify: `src/components/ImportBackup.test.tsx`
+
+**Interfaces:**
+- Consumes: `Entry`, `EntryType` (Task 3); `SyncBundle` (Task 11).
+- Produces: `isEntry(value: unknown): value is Entry`, `isSyncBundle(value: unknown): value is SyncBundle` (in `src/sync/validate.ts`); `QrScanner` gains an `onCancel: () => void` prop.
+
+- [ ] **Step 1: Write the failing tests for the validators**
+
+```ts
+// src/sync/validate.test.ts
+import { describe, it, expect } from 'vitest';
+import { isEntry, isSyncBundle } from './validate';
+import { createNote, createEvent } from '../models/entry';
+
+describe('isEntry', () => {
+  it('accepts a genuine note entry', () => {
+    expect(isEntry(createNote('hello', 'device-1'))).toBe(true);
+  });
+
+  it('accepts a genuine event entry', () => {
+    expect(isEntry(createEvent('dentist', '2026-08-01', '09:00', 'device-1'))).toBe(true);
+  });
+
+  it('rejects null and non-object values', () => {
+    expect(isEntry(null)).toBe(false);
+    expect(isEntry('not an entry')).toBe(false);
+    expect(isEntry(42)).toBe(false);
+  });
+
+  it('rejects an object missing required fields', () => {
+    expect(isEntry({ id: '1', type: 'note' })).toBe(false);
+  });
+
+  it('rejects an object with the wrong type for a field', () => {
+    const entry = createNote('hello', 'device-1');
+    expect(isEntry({ ...entry, tags: 'not-an-array' })).toBe(false);
+  });
+
+  it('rejects an invalid type value', () => {
+    const entry = createNote('hello', 'device-1');
+    expect(isEntry({ ...entry, type: 'reminder' })).toBe(false);
+  });
+});
+
+describe('isSyncBundle', () => {
+  it('accepts a genuine bundle', () => {
+    const bundle = { senderDeviceId: 'device-1', entries: [createNote('hello', 'device-1')] };
+    expect(isSyncBundle(bundle)).toBe(true);
+  });
+
+  it('accepts a bundle with an empty entries array', () => {
+    expect(isSyncBundle({ senderDeviceId: 'device-1', entries: [] })).toBe(true);
+  });
+
+  it('rejects a bundle missing senderDeviceId', () => {
+    expect(isSyncBundle({ entries: [] })).toBe(false);
+  });
+
+  it('rejects a bundle whose entries contain something invalid', () => {
+    expect(isSyncBundle({ senderDeviceId: 'device-1', entries: [{ bogus: true }] })).toBe(false);
+  });
+
+  it('rejects non-object values', () => {
+    expect(isSyncBundle(null)).toBe(false);
+    expect(isSyncBundle('nope')).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npm test -- validate`
+Expected: FAIL — `src/sync/validate.ts` does not exist yet.
+
+- [ ] **Step 3: Write `src/sync/validate.ts`**
+
+```ts
+import { Entry } from '../models/entry';
+import { SyncBundle } from './syncActions';
+
+export function isEntry(value: unknown): value is Entry {
+  if (typeof value !== 'object' || value === null) return false;
+  const e = value as Record<string, unknown>;
+  if (typeof e.id !== 'string') return false;
+  if (e.type !== 'note' && e.type !== 'event') return false;
+  if (typeof e.text !== 'string') return false;
+  if (!Array.isArray(e.tags) || !e.tags.every((t) => typeof t === 'string')) return false;
+  if (typeof e.createdAt !== 'number') return false;
+  if (typeof e.modifiedAt !== 'number') return false;
+  if (typeof e.deviceId !== 'string') return false;
+  if (typeof e.deleted !== 'boolean') return false;
+  if (e.eventDate !== undefined && typeof e.eventDate !== 'string') return false;
+  if (e.eventTime !== undefined && typeof e.eventTime !== 'string') return false;
+  return true;
+}
+
+export function isSyncBundle(value: unknown): value is SyncBundle {
+  if (typeof value !== 'object' || value === null) return false;
+  const b = value as Record<string, unknown>;
+  if (typeof b.senderDeviceId !== 'string') return false;
+  if (!Array.isArray(b.entries)) return false;
+  return b.entries.every(isEntry);
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npm test -- validate`
+Expected: PASS (11 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/sync/validate.ts src/sync/validate.test.ts
+git commit -m "feat: add runtime validation for untrusted scanned and imported entry data"
+```
+
+- [ ] **Step 6: Use the validator in `SyncScreen`, and add a Cancel button to `QrScanner`**
+
+In `src/components/QrScanner.tsx`, add an `onCancel: () => void` prop to `QrScannerProps`, and render a Cancel button that calls it (alongside the existing status text), e.g. right after the `<video>` element:
+
+```tsx
+<button onClick={onCancel}>Cancel</button>
+```
+
+In `src/components/SyncScreen.tsx`, import `isSyncBundle` from `../sync/validate`, wrap `handleScanned`'s body in a try/catch, validate the reassembled data before treating it as a `SyncBundle`, and pass an `onCancel` to `QrScanner` that returns to the menu:
+
+```tsx
+async function handleScanned(data: unknown) {
+  if (!isSyncBundle(data)) {
+    setScanError('That QR sequence was not a valid Jotterpad sync bundle. Try scanning again.');
+    setStep('menu');
+    return;
+  }
+  try {
+    const { merged, conflicts } = await applyScannedBundle(cryptoKey, entries, data);
+    onMerged(merged, conflicts);
+  } catch {
+    setScanError('Something went wrong applying the scanned data. Nothing was changed.');
+  }
+  setStep('menu');
+}
+```
+
+Add a `const [scanError, setScanError] = useState<string | null>(null);` alongside `SyncScreen`'s existing state, and render `{scanError && <p role="alert">{scanError}</p>}` in the menu view. Pass `onCancel={() => setStep('menu')}` to the `<QrScanner>` element.
+
+- [ ] **Step 7: Use the validator in `ImportBackup`**
+
+In `src/components/ImportBackup.tsx`, after `restoreBackup` returns `imported`, validate it's genuinely an array of entries before merging:
+
+```tsx
+const imported = await restoreBackup(secret, backupFile);
+if (!Array.isArray(imported) || !imported.every(isEntry)) {
+  setError('This backup file is corrupted or is not a Jotterpad backup.');
+  return;
+}
+const { merged, conflicts } = mergeEntries(localEntries, imported, 0);
+```
+
+Import `isEntry` from `../sync/validate` at the top of the file.
+
+- [ ] **Step 8: Add tests for the new validation paths**
+
+Add to `src/components/ImportBackup.test.tsx`:
+
+```tsx
+it('shows an error when the decrypted backup is not a valid entry array', async () => {
+  const backup = await createBackup('correct secret', []);
+  // Tamper with the backup after encryption isn't practical here, so instead simulate a
+  // corrupted decrypted payload by creating a backup whose "entries" were never real Entry
+  // objects — patch restoreBackup's output shape indirectly via a backup created from bad data.
+  const badEntries = [{ bogus: true }] as unknown as Parameters<typeof createBackup>[1];
+  const badBackup = await createBackup('correct secret', badEntries);
+  const { key } = await deriveKey('local-pin');
+  const user = userEvent.setup();
+  render(<ImportBackup cryptoKey={key} localEntries={[]} onImported={vi.fn()} />);
+  await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'correct secret');
+  await user.upload(screen.getByLabelText('backup file'), makeFile(JSON.stringify(badBackup)));
+  expect(await screen.findByText(/corrupted or is not a jotterpad backup/i)).toBeInTheDocument();
+});
+```
+
+- [ ] **Step 9: Run tests to verify they pass**
+
+Run: `npm test -- ImportBackup`
+Expected: PASS (4 tests: the existing 3 plus this one)
+
+- [ ] **Step 10: Run the full suite, typecheck, and build**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run build`
+Expected: all pass, zero type errors, build succeeds.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/components/SyncScreen.tsx src/components/QrScanner.tsx src/components/ImportBackup.tsx src/components/ImportBackup.test.tsx
+git commit -m "fix: validate untrusted scan/import data and add a way to cancel out of a stuck scan"
+```
+
+---
+
+## Task 21: PWA Icons, Feed Auto-Scroll, and Idle Reminder Rescheduling
+
+**Added after the final whole-branch review**: three UX gaps identified as worth fixing now rather than deferring: (1) the manifest only declares an SVG icon, which iOS's "Add to Home Screen" doesn't read, degrading install on an explicitly-supported platform; (2) the feed never scrolls to the newest entry, so on a non-empty timeline a freshly captured note can land off-screen; (3) reminders are only rescheduled when the entries array changes, so an event that crosses into the 24-hour reminder window purely from time passing (with the app left open, untouched) never gets scheduled.
+
+**Files:**
+- Create: `public/icon-192.png`
+- Create: `public/icon-512.png`
+- Modify: `vite.config.ts`
+- Modify: `index.html`
+- Modify: `src/components/Timeline.tsx`
+- Modify: `src/App.tsx`
+
+**Interfaces:**
+- No new exported signatures — presentational/scheduling changes only.
+
+- [ ] **Step 1: Confirm the PNG icons are present**
+
+`public/icon-192.png` and `public/icon-512.png` have already been generated (solid dark-background squares matching `public/icon.svg`'s color, 192×192 and 512×512 respectively) and placed in `public/` ahead of this task, since hand-rolling a PNG encoder is unnecessary risk for a subagent to redo. Run `file public/icon-192.png public/icon-512.png` and confirm both report valid PNG image data at the expected dimensions before proceeding. If either file is missing, stop and report it — do not attempt to regenerate them from scratch; ask for them to be restored instead.
+
+- [ ] **Step 2: Update `vite.config.ts`'s manifest**
+
+Add the PNG entries to the existing `icons` array (keep the existing SVG entries too, so browsers that prefer SVG still get it):
+
+```ts
+icons: [
+  { src: '/icon.svg', sizes: '192x192', type: 'image/svg+xml' },
+  { src: '/icon.svg', sizes: '512x512', type: 'image/svg+xml' },
+  { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+  { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+],
+```
+
+- [ ] **Step 3: Add an apple-touch-icon link to `index.html`**
+
+Add this inside `<head>`, after the existing `<meta name="viewport" ...>` tag:
+
+```html
+<link rel="apple-touch-icon" href="/icon-192.png" />
+```
+
+- [ ] **Step 4: Add feed auto-scroll to `src/components/Timeline.tsx`**
+
+Add a ref to the feed container and scroll it to the bottom whenever the entry list changes:
+
+```tsx
+import { useEffect, useRef } from 'react';
+import { Entry } from '../models/entry';
+import { CaptureBar } from './CaptureBar';
+import { EntryItem } from './EntryItem';
+
+interface TimelineProps {
+  entries: Entry[];
+  onAddNote: (rawText: string) => void;
+  onAddEvent: (rawText: string, eventDate: string, eventTime: string) => void;
+  onDelete: (id: string) => void;
+  onEdit: (id: string, rawText: string, eventDate?: string, eventTime?: string) => void;
+}
+
+function eventTimestamp(entry: Entry): number {
+  return new Date(`${entry.eventDate}T${entry.eventTime || '00:00'}`).getTime();
+}
+
+export function Timeline({ entries, onAddNote, onAddEvent, onDelete, onEdit }: TimelineProps) {
+  const now = Date.now();
+  const feedRef = useRef<HTMLDivElement>(null);
+
+  const past = entries
+    .filter((e) => e.type === 'note' || (e.eventDate && eventTimestamp(e) <= now))
+    .sort((a, b) => a.createdAt - b.createdAt);
+
+  const upcoming = entries
+    .filter((e) => e.type === 'event' && e.eventDate && eventTimestamp(e) > now)
+    .sort((a, b) => eventTimestamp(a) - eventTimestamp(b));
+
+  useEffect(() => {
+    feedRef.current?.scrollTo({ top: feedRef.current.scrollHeight });
+  }, [entries]);
+
+  return (
+    <div className="timeline">
+      <div className="feed" ref={feedRef}>
+        {past.map((entry) => (
+          <EntryItem key={entry.id} entry={entry} onDelete={onDelete} onEdit={onEdit} />
+        ))}
+        {upcoming.map((entry) => (
+          <EntryItem key={entry.id} entry={entry} onDelete={onDelete} onEdit={onEdit} />
+        ))}
+      </div>
+      <CaptureBar onAddNote={onAddNote} onAddEvent={onAddEvent} />
+    </div>
+  );
+}
+```
+
+No new test is required for this step — `scrollTo` is not implemented in jsdom and asserting on it would test the browser, not the app; this is verified manually in Step 7.
+
+- [ ] **Step 5: Add a periodic reminder rescan to `src/App.tsx`**
+
+Add a second effect alongside the existing entries-keyed reminder effect, using `setInterval` to rescan hourly so events crossing into the 24-hour window while the app sits idle still get scheduled:
+
+```tsx
+useEffect(() => {
+  scheduleEventReminders(entries);
+}, [entries]);
+
+useEffect(() => {
+  const interval = setInterval(() => {
+    scheduleEventReminders(entries);
+  }, 60 * 60 * 1000);
+  return () => clearInterval(interval);
+}, [entries]);
+```
+
+(Both effects reference the same `entries` value; the second just adds a time-based trigger in addition to the existing change-based one. `scheduleEventReminders`'s own internal registry, built in Task 13, already makes repeated calls with the same data a safe no-op re-schedule.)
+
+- [ ] **Step 6: Run the full suite, typecheck, and build**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run build`
+Expected: all pass (same count as before this task, since no test-observable behavior changed), zero type errors, build succeeds. Confirm `dist/manifest.webmanifest` includes all four icon entries and `dist/icon-192.png`/`dist/icon-512.png` exist in the build output.
+
+- [ ] **Step 7: Manual verification**
+
+Run: `npm run build && npm run dev`
+
+In a browser: confirm the manifest (via devtools Application tab) lists both PNG icons; capture several notes until the feed exceeds one screenful and confirm the view scrolls to show the newest one automatically; leave the app open and confirm (via devtools, faking the system clock forward, or just reasoning about the code) that the hourly rescan would pick up an event crossing the 24h boundary without requiring a new capture/delete/sync.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add public/icon-192.png public/icon-512.png vite.config.ts index.html src/components/Timeline.tsx src/App.tsx
+git commit -m "fix: add PNG app icons for iOS install, auto-scroll the feed, and rescan reminders hourly while idle"
+```
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage:** Overview/architecture → Tasks 1, 14. Security (PIN, encryption, warnings) → Tasks 2, 5, 6, 12. Data model → Task 3. Sync protocol (QR, merge, first-sync-is-full-merge) → Tasks 7, 8, 11. UI (timeline, capture bar, future events, tag/search, lock screen, export/import, reminder caveat) → Tasks 6, 9, 10, 11, 12, 13. Tech stack → Task 1 (scaffold), 11 (qrcode/jsqr). Testing approach (merge + crypto prioritized, QR flow manual) → reflected throughout, explicit in Task 11.
