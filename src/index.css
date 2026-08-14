@@ -171,7 +171,7 @@ input {
   padding: 0 16px;
 }
 
-.lock-screen [role='alert'] {
+[role='alert'] {
   color: var(--danger);
   font-size: 14px;
 }
