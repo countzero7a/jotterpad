@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import 'fake-indexeddb/auto';
-import { prepareOutgoingBundle, applyScannedBundle, SyncBundle } from './syncActions';
+import { prepareOutgoingBundle, applyScannedBundle, markBundleSent, SyncBundle } from './syncActions';
 import { parseFrame, FrameReassembler } from './qrProtocol';
 import { createNote } from '../models/entry';
 import { deriveKey } from '../crypto/crypto';
-import { getDb, setLastSyncAt } from '../storage/db';
+import { getDb, setLastSyncAt, setLastSentAt } from '../storage/db';
 import { getAllEntries } from '../storage/entryRepository';
 
 async function resetDb() {
@@ -19,7 +19,7 @@ describe('syncActions', () => {
   });
 
   it('prepareOutgoingBundle only includes entries changed since the last sync', async () => {
-    await setLastSyncAt(1000);
+    await setLastSentAt(1000);
     const oldEntry = createNote('old', 'device-a');
     oldEntry.modifiedAt = 500;
     const newEntry = createNote('new', 'device-a');
@@ -73,5 +73,14 @@ describe('syncActions', () => {
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0].local.text).toBe('local edit');
     expect(conflicts[0].remote.text).toBe('remote edit');
+  });
+
+  it('markBundleSent advances lastSentAt, and a subsequent call reflects it', async () => {
+    const { setLastSentAt: seedSentAt } = await import('../storage/db');
+    await seedSentAt(0);
+    const before = Date.now();
+    await markBundleSent();
+    const { getLastSentAt } = await import('../storage/db');
+    expect(await getLastSentAt()).toBeGreaterThanOrEqual(before);
   });
 });

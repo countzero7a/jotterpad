@@ -2,7 +2,7 @@ import { Entry } from '../models/entry';
 import { mergeEntries, ConflictPair, selectChangedSince } from './merge';
 import { chunkPayload } from './qrProtocol';
 import { saveEntry } from '../storage/entryRepository';
-import { getLastSyncAt, setLastSyncAt } from '../storage/db';
+import { getLastSyncAt, setLastSyncAt, getLastSentAt, setLastSentAt } from '../storage/db';
 
 export interface SyncBundle {
   senderDeviceId: string;
@@ -10,10 +10,14 @@ export interface SyncBundle {
 }
 
 export async function prepareOutgoingBundle(deviceId: string, entries: Entry[]): Promise<string[]> {
-  const lastSyncAt = await getLastSyncAt();
-  const changed = selectChangedSince(entries, lastSyncAt);
+  const lastSentAt = await getLastSentAt();
+  const changed = selectChangedSince(entries, lastSentAt);
   const bundle: SyncBundle = { senderDeviceId: deviceId, entries: changed };
   return chunkPayload(bundle, crypto.randomUUID());
+}
+
+export async function markBundleSent(): Promise<void> {
+  await setLastSentAt(Date.now());
 }
 
 export async function applyScannedBundle(

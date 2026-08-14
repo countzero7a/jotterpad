@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Entry } from '../models/entry';
 import { ConflictPair } from '../sync/merge';
-import { prepareOutgoingBundle, applyScannedBundle, SyncBundle } from '../sync/syncActions';
+import { prepareOutgoingBundle, applyScannedBundle, markBundleSent, SyncBundle } from '../sync/syncActions';
 import { QrDisplay } from './QrDisplay';
 import { QrScanner } from './QrScanner';
 
@@ -31,7 +31,14 @@ export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: 
   }
 
   if (step === 'showing') {
-    return <QrDisplay frames={frames} onDone={() => setStep('menu')} />;
+    return (
+      <QrDisplay
+        frames={frames}
+        onDone={() => {
+          markBundleSent().then(() => setStep('menu'));
+        }}
+      />
+    );
   }
   if (step === 'scanning') {
     return <QrScanner onComplete={handleScanned} />;

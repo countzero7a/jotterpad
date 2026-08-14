@@ -51,3 +51,12 @@ export async function getLastSyncAt(): Promise<number> {
 export async function setLastSyncAt(timestamp: number): Promise<void> {
   await setMeta('lastSyncAt', String(timestamp));
 }
+
+export async function getLastSentAt(): Promise<number> {
+  const raw = await getMeta('lastSentAt');
+  return raw ? Number(raw) : 0;
+}
+
+export async function setLastSentAt(timestamp: number): Promise<void> {
+  await setMeta('lastSentAt', String(timestamp));
+}
