@@ -13,7 +13,10 @@ export default defineConfig({
         theme_color: '#1c1c1e',
         background_color: '#1c1c1e',
         display: 'standalone',
-        icons: [],
+        icons: [
+          { src: '/icon.svg', sizes: '192x192', type: 'image/svg+xml' },
+          { src: '/icon.svg', sizes: '512x512', type: 'image/svg+xml' },
+        ],
       },
     }),
   ],
