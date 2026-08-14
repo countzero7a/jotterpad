@@ -15,6 +15,7 @@ export function EntryItem({ entry, onDelete, onEdit }: EntryItemProps) {
 
   function handleSave() {
     if (!text.trim()) return;
+    if (entry.type === 'event' && !eventDate) return;
     onEdit(
       entry.id,
       text,

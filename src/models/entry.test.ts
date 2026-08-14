@@ -110,4 +110,10 @@ describe('updateEntry', () => {
     expect(updated.eventDate).toBeUndefined();
     expect(updated.eventTime).toBeUndefined();
   });
+
+  it('preserves eventTime when eventTime is undefined', () => {
+    const original = createEvent('dentist', '2026-08-01', '09:00', 'device-1');
+    const updated = updateEntry(original, 'dentist checkup', 'device-1', '2026-08-02', undefined);
+    expect(updated.eventTime).toBe('09:00');
+  });
 });

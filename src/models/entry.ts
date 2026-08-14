@@ -76,7 +76,7 @@ export function updateEntry(
   const updated: Entry = { ...entry, text, tags, modifiedAt: Date.now(), deviceId };
   if (entry.type === 'event') {
     updated.eventDate = eventDate ?? entry.eventDate;
-    updated.eventTime = eventTime;
+    updated.eventTime = eventTime ?? entry.eventTime;
   }
   return updated;
 }

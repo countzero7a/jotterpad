@@ -59,4 +59,17 @@ describe('EntryItem', () => {
     await user.click(screen.getByRole('button', { name: 'Save' }));
     expect(onEdit).toHaveBeenCalledWith(entry.id, 'dentist', '2026-08-05', '09:00');
   });
+
+  it('does not call onEdit when saving an event with an empty date', async () => {
+    const user = userEvent.setup();
+    const onEdit = vi.fn();
+    const entry = createEvent('dentist', '2026-08-01', '09:00', 'device-1');
+    const { container } = render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={onEdit} />);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const dateInput = container.querySelector('input[type="date"]');
+    if (!dateInput) throw new Error('date input not found');
+    fireEvent.change(dateInput, { target: { value: '' } });
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onEdit).not.toHaveBeenCalled();
+  });
 });
