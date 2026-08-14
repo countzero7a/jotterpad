@@ -15,7 +15,6 @@ describe('reminders', () => {
     global.Notification = vi.fn().mockImplementation((...args) => notificationSpy(...args));
     // @ts-expect-error test stub
     global.Notification.permission = 'granted';
-    // @ts-expect-error test stub
     global.Notification.requestPermission = vi.fn().mockResolvedValue('granted');
     notificationSpy.mockClear();
   });
