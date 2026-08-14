@@ -7,13 +7,14 @@ interface TimelineProps {
   onAddNote: (rawText: string) => void;
   onAddEvent: (rawText: string, eventDate: string, eventTime: string) => void;
   onDelete: (id: string) => void;
+  onEdit: (id: string, rawText: string, eventDate?: string, eventTime?: string) => void;
 }
 
 function eventTimestamp(entry: Entry): number {
   return new Date(`${entry.eventDate}T${entry.eventTime || '00:00'}`).getTime();
 }
 
-export function Timeline({ entries, onAddNote, onAddEvent, onDelete }: TimelineProps) {
+export function Timeline({ entries, onAddNote, onAddEvent, onDelete, onEdit }: TimelineProps) {
   const now = Date.now();
 
   const past = entries
@@ -28,10 +29,10 @@ export function Timeline({ entries, onAddNote, onAddEvent, onDelete }: TimelineP
     <div className="timeline">
       <div className="feed">
         {past.map((entry) => (
-          <EntryItem key={entry.id} entry={entry} onDelete={onDelete} />
+          <EntryItem key={entry.id} entry={entry} onDelete={onDelete} onEdit={onEdit} />
         ))}
         {upcoming.map((entry) => (
-          <EntryItem key={entry.id} entry={entry} onDelete={onDelete} />
+          <EntryItem key={entry.id} entry={entry} onDelete={onDelete} onEdit={onEdit} />
         ))}
       </div>
       <CaptureBar onAddNote={onAddNote} onAddEvent={onAddEvent} />
