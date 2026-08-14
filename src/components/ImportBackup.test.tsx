@@ -44,4 +44,18 @@ describe('ImportBackup', () => {
 
     expect(await screen.findByText(/could not decrypt/i, {}, { timeout: 5000 })).toBeInTheDocument();
   });
+
+  it('shows an error for invalid JSON in the backup file', async () => {
+    const { key } = await deriveKey('local-pin');
+    const user = userEvent.setup();
+
+    render(<ImportBackup cryptoKey={key} localEntries={[]} onImported={vi.fn()} />);
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'some secret');
+    await user.upload(
+      screen.getByLabelText('backup file'),
+      makeFile('not valid json')
+    );
+
+    expect(await screen.findByText(/could not decrypt/i, {}, { timeout: 5000 })).toBeInTheDocument();
+  });
 });

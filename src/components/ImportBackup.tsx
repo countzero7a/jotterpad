@@ -27,9 +27,9 @@ export function ImportBackup({ cryptoKey, localEntries, onImported }: ImportBack
     setError('');
     const file = e.target.files?.[0];
     if (!file) return;
-    const text = await readFileAsText(file);
-    const backupFile = JSON.parse(text) as BackupFile;
     try {
+      const text = await readFileAsText(file);
+      const backupFile = JSON.parse(text) as BackupFile;
       const imported = await restoreBackup(secret, backupFile);
       const { merged, conflicts } = mergeEntries(localEntries, imported, 0);
       for (const entry of merged) {
