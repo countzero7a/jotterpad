@@ -18,9 +18,15 @@ type SyncStep = 'menu' | 'showing' | 'scanning';
 export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: SyncScreenProps) {
   const [step, setStep] = useState<SyncStep>('menu');
   const [frames, setFrames] = useState<string[]>([]);
+  const [sentEntries, setSentEntries] = useState<Entry[]>([]);
 
   async function startShowing() {
-    setFrames(await prepareOutgoingBundle(deviceId, entries));
+    const { frames: outgoingFrames, sentEntries: outgoingEntries } = await prepareOutgoingBundle(
+      deviceId,
+      entries
+    );
+    setFrames(outgoingFrames);
+    setSentEntries(outgoingEntries);
     setStep('showing');
   }
 
@@ -35,7 +41,7 @@ export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: 
       <QrDisplay
         frames={frames}
         onDone={() => {
-          markBundleSent().then(() => setStep('menu'));
+          markBundleSent(sentEntries).finally(() => setStep('menu'));
         }}
       />
     );

@@ -18,14 +18,14 @@ describe('syncActions', () => {
     await resetDb();
   });
 
-  it('prepareOutgoingBundle only includes entries changed since the last sync', async () => {
+  it('prepareOutgoingBundle only includes entries changed since the last send', async () => {
     await setLastSentAt(1000);
     const oldEntry = createNote('old', 'device-a');
     oldEntry.modifiedAt = 500;
     const newEntry = createNote('new', 'device-a');
     newEntry.modifiedAt = 2000;
 
-    const frames = await prepareOutgoingBundle('device-a', [oldEntry, newEntry]);
+    const { frames, sentEntries } = await prepareOutgoingBundle('device-a', [oldEntry, newEntry]);
     const reassembler = new FrameReassembler();
     frames.forEach((f) => reassembler.addFrame(parseFrame(f)));
     const bundle = reassembler.getResult<SyncBundle>();
@@ -33,6 +33,8 @@ describe('syncActions', () => {
     expect(bundle.senderDeviceId).toBe('device-a');
     expect(bundle.entries).toHaveLength(1);
     expect(bundle.entries[0].text).toBe('new');
+    expect(sentEntries).toHaveLength(1);
+    expect(sentEntries[0].text).toBe('new');
   });
 
   it('applyScannedBundle merges remote entries and persists them', async () => {
@@ -75,12 +77,47 @@ describe('syncActions', () => {
     expect(conflicts[0].remote.text).toBe('remote edit');
   });
 
-  it('markBundleSent advances lastSentAt, and a subsequent call reflects it', async () => {
-    const { setLastSentAt: seedSentAt } = await import('../storage/db');
-    await seedSentAt(0);
-    const before = Date.now();
-    await markBundleSent();
+  it('markBundleSent advances lastSentAt to the highest modifiedAt among the sent entries', async () => {
+    await setLastSentAt(0);
+    const entryA = createNote('a', 'device-a');
+    entryA.modifiedAt = 1500;
+    const entryB = createNote('b', 'device-a');
+    entryB.modifiedAt = 3000;
+
+    await markBundleSent([entryA, entryB]);
+
     const { getLastSentAt } = await import('../storage/db');
-    expect(await getLastSentAt()).toBeGreaterThanOrEqual(before);
+    expect(await getLastSentAt()).toBe(3000);
+  });
+
+  it('markBundleSent never regresses lastSentAt below its current value', async () => {
+    await setLastSentAt(5000);
+    const oldEntry = createNote('old', 'device-a');
+    oldEntry.modifiedAt = 1000;
+
+    await markBundleSent([oldEntry]);
+
+    const { getLastSentAt } = await import('../storage/db');
+    expect(await getLastSentAt()).toBe(5000);
+  });
+
+  it('markBundleSent leaves lastSentAt unchanged when no entries were sent', async () => {
+    await setLastSentAt(2000);
+
+    await markBundleSent([]);
+
+    const { getLastSentAt } = await import('../storage/db');
+    expect(await getLastSentAt()).toBe(2000);
+  });
+
+  it('markBundleSent does not use wall-clock time as the watermark', async () => {
+    await setLastSentAt(0);
+    const entry = createNote('old note shown late', 'device-a');
+    entry.modifiedAt = 1000; // far in the past relative to Date.now()
+
+    await markBundleSent([entry]);
+
+    const { getLastSentAt } = await import('../storage/db');
+    expect(await getLastSentAt()).toBe(1000);
   });
 });
