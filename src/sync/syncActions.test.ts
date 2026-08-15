@@ -121,7 +121,7 @@ describe('syncActions', () => {
     expect(await getLastSentAt()).toBe(1000);
   });
 
-  it('markBundleSent clamps the watermark to preparedAt so a peer clock-skewed entry cannot push lastSentAt into the future', async () => {
+  it('excludes a peer clock-skewed entry from the watermark entirely so lastSentAt never reflects a wall-clock reading', async () => {
     await setLastSentAt(0);
     // Simulates an entry echoed back from a peer whose clock runs an hour ahead of ours.
     // Union semantics in mergeEntries mean sentEntries can include entries we originally
@@ -134,15 +134,37 @@ describe('syncActions', () => {
 
     const { getLastSentAt } = await import('../storage/db');
     const lastSentAt = await getLastSentAt();
-    expect(lastSentAt).toBeLessThanOrEqual(preparedAt);
-    expect(Math.abs(lastSentAt - preparedAt)).toBeLessThan(5000);
+    // The skewed entry must not inflate the watermark at all -- not even up to
+    // preparedAt. It contributed nothing, so lastSentAt stays at prev (0).
+    expect(lastSentAt).toBeLessThan(skewedEntry.modifiedAt);
+    expect(lastSentAt).toBe(0);
 
     // A genuinely new local note captured after this sync must still go out next time --
-    // it must not be excluded by a clock-skew-inflated watermark.
+    // it must not be excluded by a clock-skew-inflated watermark. Use a timestamp
+    // strictly greater than preparedAt (rather than a fresh Date.now() call that
+    // could tie with preparedAt) so the test can't flake on timing.
     const newLocalNote = createNote('new local note after the skewed sync', 'device-a');
-    newLocalNote.modifiedAt = Date.now();
+    newLocalNote.modifiedAt = preparedAt + 1000;
 
     const { sentEntries } = await prepareOutgoingBundle('device-a', [newLocalNote]);
     expect(sentEntries.map((e) => e.text)).toContain('new local note after the skewed sync');
+  });
+
+  it('markBundleSent never regresses lastSentAt below prev even when preparedAt is behind it (backward clock step)', async () => {
+    await setLastSentAt(5000);
+    // A backward local clock step: preparedAt (this device's "now" at prepare
+    // time) is somehow less than the already-stored watermark. No entry's
+    // modifiedAt can be <= preparedAt here without also being <= prev, so
+    // nothing should be able to move the watermark -- and critically, it must
+    // not be "healed" downward to preparedAt either. Monotonicity is the
+    // deliberate, chosen behavior, not a bug to paper over.
+    const preparedAt = 4000;
+    const entry = createNote('sent while clock was skewed backward', 'device-a');
+    entry.modifiedAt = 3000;
+
+    await markBundleSent([entry], preparedAt);
+
+    const { getLastSentAt } = await import('../storage/db');
+    expect(await getLastSentAt()).toBe(5000);
   });
 });

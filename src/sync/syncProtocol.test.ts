@@ -27,12 +27,18 @@ function show(device: VirtualDevice): ShowResult {
 }
 
 // Mirrors production's markBundleSent: advances lastSentAt to the high-water
-// mark of (prev, ...sentEntries.modifiedAt), then clamps it to preparedAt so
-// that a peer-clock-skewed entry echoed back through sentEntries can never
-// push lastSentAt past this device's own "now" at prepare time.
+// mark of (prev, ...sentEntries.modifiedAt), but only entries with
+// modifiedAt <= preparedAt are allowed to participate in that max. This
+// excludes -- rather than post-hoc clamps -- a peer-clock-skewed entry echoed
+// back through sentEntries, so it can never contribute a wall-clock reading
+// (or anything derived from one) to lastSentAt. Starting from device.lastSentAt
+// and only ever taking Math.max over admitted entries guarantees lastSentAt
+// never regresses.
 function markSent(device: VirtualDevice, sentEntries: Entry[], preparedAt: number): void {
-  const highWaterMark = sentEntries.reduce((max, e) => Math.max(max, e.modifiedAt), device.lastSentAt);
-  device.lastSentAt = Math.min(highWaterMark, preparedAt);
+  device.lastSentAt = sentEntries.reduce(
+    (max, e) => (e.modifiedAt <= preparedAt ? Math.max(max, e.modifiedAt) : max),
+    device.lastSentAt
+  );
 }
 
 function scan(device: VirtualDevice, frames: string[]): void {

@@ -31,7 +31,9 @@ export async function prepareOutgoingBundle(deviceId: string, entries: Entry[]):
 // can be later than a note created while the QR codes were still on screen --
 // silently and permanently excluding that note from every future outgoing
 // bundle. That's why the high-water mark comes from the entries' own
-// modifiedAt timestamps instead.
+// modifiedAt timestamps instead -- lastSentAt is NEVER set to a wall-clock
+// reading, only ever to the modifiedAt of an entry that was genuinely part of
+// a sent bundle (or left unchanged if nothing qualifies).
 //
 // But sentEntries can include entries that originated on the PEER: union
 // semantics in mergeEntries mean a device re-sends everything it knows about
@@ -41,16 +43,25 @@ export async function prepareOutgoingBundle(deviceId: string, entries: Entry[]):
 // can push lastSentAt into our own future -- after which every note captured
 // locally is silently and permanently excluded until local wall-clock time
 // catches up. `preparedAt` is `Date.now()` read on THIS device at the moment
-// the bundle was prepared (see prepareOutgoingBundle above), so clamping the
-// high-water mark to it caps lastSentAt at "now, per our own clock" no matter
-// what timestamps arrived from the peer. preparedAt is never lower than prev
-// in any legitimate call sequence (local time doesn't run backward), so this
-// clamp is a no-op for the normal case and only bites when a peer-supplied
-// timestamp is skewed into the future.
+// the bundle was prepared (see prepareOutgoingBundle above). Rather than
+// computing the max over every sentEntries and then clamping the result down
+// to preparedAt -- which would collapse to preparedAt itself, a wall-clock
+// reading, whenever some entry is future-skewed -- we instead exclude
+// future-skewed entries from the reduce entirely: only entries with
+// modifiedAt <= preparedAt get to participate in the max. A future-skewed
+// peer entry simply doesn't get to contribute; it will be redundantly
+// re-sent next session, which is harmless because mergeEntries' content-
+// equality check makes that a no-op on the receiving end. Because the reduce
+// starts at prev and only ever takes Math.max over admitted entries,
+// lastSentAt is guaranteed to never regress below prev, with no separate
+// clamp needed.
 export async function markBundleSent(sentEntries: Entry[], preparedAt: number): Promise<void> {
   const prev = await getLastSentAt();
-  const highWaterMark = sentEntries.reduce((max, e) => Math.max(max, e.modifiedAt), prev);
-  await setLastSentAt(Math.min(highWaterMark, preparedAt));
+  const highWaterMark = sentEntries.reduce(
+    (max, e) => (e.modifiedAt <= preparedAt ? Math.max(max, e.modifiedAt) : max),
+    prev
+  );
+  await setLastSentAt(highWaterMark);
 }
 
 export async function applyScannedBundle(
