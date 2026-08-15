@@ -84,7 +84,7 @@ describe('syncActions', () => {
     const entryB = createNote('b', 'device-a');
     entryB.modifiedAt = 3000;
 
-    await markBundleSent([entryA, entryB]);
+    await markBundleSent([entryA, entryB], Date.now());
 
     const { getLastSentAt } = await import('../storage/db');
     expect(await getLastSentAt()).toBe(3000);
@@ -95,7 +95,7 @@ describe('syncActions', () => {
     const oldEntry = createNote('old', 'device-a');
     oldEntry.modifiedAt = 1000;
 
-    await markBundleSent([oldEntry]);
+    await markBundleSent([oldEntry], Date.now());
 
     const { getLastSentAt } = await import('../storage/db');
     expect(await getLastSentAt()).toBe(5000);
@@ -104,7 +104,7 @@ describe('syncActions', () => {
   it('markBundleSent leaves lastSentAt unchanged when no entries were sent', async () => {
     await setLastSentAt(2000);
 
-    await markBundleSent([]);
+    await markBundleSent([], Date.now());
 
     const { getLastSentAt } = await import('../storage/db');
     expect(await getLastSentAt()).toBe(2000);
@@ -115,9 +115,34 @@ describe('syncActions', () => {
     const entry = createNote('old note shown late', 'device-a');
     entry.modifiedAt = 1000; // far in the past relative to Date.now()
 
-    await markBundleSent([entry]);
+    await markBundleSent([entry], Date.now());
 
     const { getLastSentAt } = await import('../storage/db');
     expect(await getLastSentAt()).toBe(1000);
+  });
+
+  it('markBundleSent clamps the watermark to preparedAt so a peer clock-skewed entry cannot push lastSentAt into the future', async () => {
+    await setLastSentAt(0);
+    // Simulates an entry echoed back from a peer whose clock runs an hour ahead of ours.
+    // Union semantics in mergeEntries mean sentEntries can include entries we originally
+    // received from the peer, stamped with the peer's (skewed) clock, not ours.
+    const skewedEntry = createNote('echoed from peer with a skewed clock', 'device-b');
+    skewedEntry.modifiedAt = Date.now() + 60 * 60 * 1000;
+
+    const preparedAt = Date.now(); // this device's own clock, captured at prepare time
+    await markBundleSent([skewedEntry], preparedAt);
+
+    const { getLastSentAt } = await import('../storage/db');
+    const lastSentAt = await getLastSentAt();
+    expect(lastSentAt).toBeLessThanOrEqual(preparedAt);
+    expect(Math.abs(lastSentAt - preparedAt)).toBeLessThan(5000);
+
+    // A genuinely new local note captured after this sync must still go out next time --
+    // it must not be excluded by a clock-skew-inflated watermark.
+    const newLocalNote = createNote('new local note after the skewed sync', 'device-a');
+    newLocalNote.modifiedAt = Date.now();
+
+    const { sentEntries } = await prepareOutgoingBundle('device-a', [newLocalNote]);
+    expect(sentEntries.map((e) => e.text)).toContain('new local note after the skewed sync');
   });
 });

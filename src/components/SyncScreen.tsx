@@ -19,14 +19,17 @@ export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: 
   const [step, setStep] = useState<SyncStep>('menu');
   const [frames, setFrames] = useState<string[]>([]);
   const [sentEntries, setSentEntries] = useState<Entry[]>([]);
+  const [preparedAt, setPreparedAt] = useState<number>(0);
 
   async function startShowing() {
-    const { frames: outgoingFrames, sentEntries: outgoingEntries } = await prepareOutgoingBundle(
-      deviceId,
-      entries
-    );
+    const {
+      frames: outgoingFrames,
+      sentEntries: outgoingEntries,
+      preparedAt: outgoingPreparedAt,
+    } = await prepareOutgoingBundle(deviceId, entries);
     setFrames(outgoingFrames);
     setSentEntries(outgoingEntries);
+    setPreparedAt(outgoingPreparedAt);
     setStep('showing');
   }
 
@@ -41,7 +44,7 @@ export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: 
       <QrDisplay
         frames={frames}
         onDone={() => {
-          markBundleSent(sentEntries).finally(() => setStep('menu'));
+          markBundleSent(sentEntries, preparedAt).finally(() => setStep('menu'));
         }}
       />
     );

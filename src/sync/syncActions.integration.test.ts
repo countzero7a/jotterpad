@@ -79,9 +79,13 @@ describe('syncActions integration: production-level two-device round trip', () =
     let aEntries = [aNote1, aNote2];
 
     // A shows its changes and marks them sent.
-    const { frames: aFrames, sentEntries: aSent } = await prepareOutgoingBundle('device-a', aEntries);
+    const {
+      frames: aFrames,
+      sentEntries: aSent,
+      preparedAt: aPreparedAt,
+    } = await prepareOutgoingBundle('device-a', aEntries);
     expect(aSent.map((e) => e.text).sort()).toEqual(['A note 1', 'A note 2']);
-    await markBundleSent(aSent);
+    await markBundleSent(aSent, aPreparedAt);
 
     // Snapshot A's storage so we can swap in B's for B's turn.
     const aSnapshot = await snapshotDb();
@@ -107,9 +111,13 @@ describe('syncActions integration: production-level two-device round trip', () =
     // prepareOutgoingBundle used lastSyncAt (the old, buggy behavior) instead of
     // lastSentAt (which is still 0 for B -- B has never sent anything), this filter
     // would exclude every entry, including B's own never-before-sent note.
-    const { frames: bFrames, sentEntries: bSent } = await prepareOutgoingBundle('device-b', bEntries);
+    const {
+      frames: bFrames,
+      sentEntries: bSent,
+      preparedAt: bPreparedAt,
+    } = await prepareOutgoingBundle('device-b', bEntries);
     expect(bSent.map((e) => e.text)).toContain('B note 1');
-    await markBundleSent(bSent);
+    await markBundleSent(bSent, bPreparedAt);
 
     // Snapshot B's final state (used for the convergence assertion below).
     const bFinalEntries = bEntries;

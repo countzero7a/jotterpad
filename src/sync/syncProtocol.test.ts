@@ -10,14 +10,29 @@ interface VirtualDevice {
   lastSentAt: number;
 }
 
-function show(device: VirtualDevice): string[] {
-  const changed = selectChangedSince(device.entries, device.lastSentAt);
-  const bundle = { senderDeviceId: device.id, entries: changed };
-  return chunkPayload(bundle, crypto.randomUUID());
+interface ShowResult {
+  frames: string[];
+  sentEntries: Entry[];
+  preparedAt: number;
 }
 
-function markSent(device: VirtualDevice): void {
-  device.lastSentAt = Date.now();
+function show(device: VirtualDevice): ShowResult {
+  // Mirrors production's prepareOutgoingBundle: preparedAt is THIS device's own
+  // clock, captured at the moment the bundle is prepared.
+  const preparedAt = Date.now();
+  const changed = selectChangedSince(device.entries, device.lastSentAt);
+  const bundle = { senderDeviceId: device.id, entries: changed };
+  const frames = chunkPayload(bundle, crypto.randomUUID());
+  return { frames, sentEntries: changed, preparedAt };
+}
+
+// Mirrors production's markBundleSent: advances lastSentAt to the high-water
+// mark of (prev, ...sentEntries.modifiedAt), then clamps it to preparedAt so
+// that a peer-clock-skewed entry echoed back through sentEntries can never
+// push lastSentAt past this device's own "now" at prepare time.
+function markSent(device: VirtualDevice, sentEntries: Entry[], preparedAt: number): void {
+  const highWaterMark = sentEntries.reduce((max, e) => Math.max(max, e.modifiedAt), device.lastSentAt);
+  device.lastSentAt = Math.min(highWaterMark, preparedAt);
 }
 
 function scan(device: VirtualDevice, frames: string[]): void {
@@ -69,21 +84,21 @@ describe('two-device sync protocol round trip', () => {
     tick();
 
     // Session 1: A shows, B scans (receives A's notes) — B's own note is untouched by this.
-    const aFrames = show(a);
+    const aShown = show(a);
     tick();
-    markSent(a);
+    markSent(a, aShown.sentEntries, aShown.preparedAt);
     tick();
-    scan(b, aFrames);
+    scan(b, aShown.frames);
     tick();
 
     // Then, in the SAME session, B shows its own changes. This is the exact scenario that
     // was broken: B just bumped its lastSyncAt during the scan above. If prepareOutgoingBundle
     // had used lastSyncAt (the old, buggy behavior), B's own note would now be excluded.
-    const bFrames = show(b);
+    const bShown = show(b);
     tick();
-    markSent(b);
+    markSent(b, bShown.sentEntries, bShown.preparedAt);
     tick();
-    scan(a, bFrames);
+    scan(a, bShown.frames);
 
     const aTexts = a.entries.map((e) => e.text).sort();
     const bTexts = b.entries.map((e) => e.text).sort();
@@ -103,18 +118,20 @@ describe('two-device sync protocol round trip', () => {
     tick();
 
     // Session 1: full exchange.
-    scan(b, show(a));
+    const aShown1 = show(a);
+    scan(b, aShown1.frames);
     tick();
-    markSent(a);
+    markSent(a, aShown1.sentEntries, aShown1.preparedAt);
     tick();
-    scan(a, show(b));
+    const bShown1 = show(b);
+    scan(a, bShown1.frames);
     tick();
-    markSent(b);
+    markSent(b, bShown1.sentEntries, bShown1.preparedAt);
     tick();
 
     // Session 2: nothing new — both outgoing bundles should be empty.
-    const aFramesEmpty = show(a);
-    const bFramesEmpty = show(b);
+    const aFramesEmpty = show(a).frames;
+    const bFramesEmpty = show(b).frames;
     const reassemblerA = new FrameReassembler();
     aFramesEmpty.forEach((f) => reassemblerA.addFrame(parseFrame(f)));
     const reassemblerB = new FrameReassembler();
@@ -125,7 +142,7 @@ describe('two-device sync protocol round trip', () => {
 
     // Session 3: A adds a new note. Only the new note should go out.
     a.entries.push(createNote('A note 2', 'device-a'));
-    const aFramesNew = show(a);
+    const aFramesNew = show(a).frames;
     const reassemblerA2 = new FrameReassembler();
     aFramesNew.forEach((f) => reassemblerA2.addFrame(parseFrame(f)));
     const sent = reassemblerA2.getResult<{ entries: Entry[] }>().entries;
