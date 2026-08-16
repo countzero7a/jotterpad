@@ -85,4 +85,24 @@ describe('EntryItem', () => {
     expect(screen.getByDisplayValue('oat milk (from other device)')).toBeInTheDocument();
     expect(screen.queryByDisplayValue('milk')).not.toBeInTheDocument();
   });
+
+  it('does not wipe an in-progress unsaved edit when the entry prop changes while already editing', async () => {
+    const user = userEvent.setup();
+    const entry = createNote('milk', 'device-1');
+    const { rerender } = render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('milk');
+    await user.clear(input);
+    await user.type(input, 'unsaved draft text');
+
+    // Simulate a sync/merge echoing an update back while the user is still
+    // editing (e.g. an in-flight save round-tripping, or an unrelated remote
+    // change). This must NOT clobber the user's in-progress typing.
+    const updatedEntry = { ...entry, text: 'synced elsewhere', modifiedAt: entry.modifiedAt + 1 };
+    rerender(<EntryItem entry={updatedEntry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+
+    expect(screen.getByDisplayValue('unsaved draft text')).toBeInTheDocument();
+    expect(screen.queryByDisplayValue('synced elsewhere')).not.toBeInTheDocument();
+  });
 });

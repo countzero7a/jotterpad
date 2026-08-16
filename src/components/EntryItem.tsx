@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Entry } from '../models/entry';
 
 interface EntryItemProps {
@@ -13,13 +13,22 @@ export function EntryItem({ entry, onDelete, onEdit }: EntryItemProps) {
   const [eventDate, setEventDate] = useState(entry.eventDate ?? '');
   const [eventTime, setEventTime] = useState(entry.eventTime ?? '');
 
+  // Always tracks the latest `entry` prop without being a dependency of the
+  // reseed effect below, so the effect can read current data on the
+  // editing=false -> true transition without also re-running (and wiping the
+  // user's in-progress draft) whenever `entry` merely changes identity while
+  // already editing (e.g. a sync echoing back with no meaningful change).
+  const entryRef = useRef(entry);
+  entryRef.current = entry;
+
   useEffect(() => {
     if (editing) {
-      setText(entry.text);
-      setEventDate(entry.eventDate ?? '');
-      setEventTime(entry.eventTime ?? '');
+      const current = entryRef.current;
+      setText(current.text);
+      setEventDate(current.eventDate ?? '');
+      setEventTime(current.eventTime ?? '');
     }
-  }, [editing, entry]);
+  }, [editing]);
 
   function handleSave() {
     if (!text.trim()) return;
