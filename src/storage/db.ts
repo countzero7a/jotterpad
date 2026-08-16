@@ -1,5 +1,4 @@
 import { openDB, DBSchema, IDBPDatabase } from 'idb';
-import { ConflictPair } from '../sync/merge';
 
 interface JotterpadSchema extends DBSchema {
   entries: {
@@ -67,13 +66,4 @@ export async function getLastSentAt(): Promise<number> {
 
 export async function setLastSentAt(timestamp: number): Promise<void> {
   await setMeta('lastSentAt', String(timestamp));
-}
-
-export async function getPendingConflicts(): Promise<ConflictPair[]> {
-  const raw = await getMeta('pendingConflicts');
-  return raw ? (JSON.parse(raw) as ConflictPair[]) : [];
-}
-
-export async function setPendingConflicts(conflicts: ConflictPair[]): Promise<void> {
-  await setMeta('pendingConflicts', JSON.stringify(conflicts));
 }

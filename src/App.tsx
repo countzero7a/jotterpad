@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { LockScreen } from './components/LockScreen';
 import { Timeline } from './components/Timeline';
 import { SearchBar } from './components/SearchBar';
@@ -9,11 +9,31 @@ import { ExportSettings } from './components/ExportSettings';
 import { ImportBackup } from './components/ImportBackup';
 import { ReminderSettings } from './components/ReminderSettings';
 import { isPinConfigured } from './auth/pin';
-import { getOrCreateDeviceId, getPendingConflicts, setPendingConflicts } from './storage/db';
+import { getOrCreateDeviceId } from './storage/db';
 import { getAllEntries, saveEntry, deleteEntry } from './storage/entryRepository';
+import { getPendingConflicts, setPendingConflicts } from './sync/conflictStore';
 import { createNote, createEvent, filterEntries, updateEntry, Entry } from './models/entry';
 import { ConflictPair } from './sync/merge';
 import { scheduleEventReminders } from './notifications/reminders';
+
+// A last-write-wins reconciliation between the live in-memory entries (`prev`)
+// and a set of entries computed from a stale snapshot (`incoming`, e.g. the
+// result of a merge/import that started before `prev` picked up a local
+// edit or delete). For any id present in both, whichever has the later
+// modifiedAt wins -- this correctly keeps a genuinely more recent local
+// edit/delete (tombstone), and correctly keeps `incoming`'s version when its
+// own timestamp is newer. IDs only present in one side are always kept.
+function reconcileWithLiveState(prev: Entry[], incoming: Entry[]): Entry[] {
+  const incomingById = new Map(incoming.map((e) => [e.id, e]));
+  const result = new Map(incomingById);
+  for (const p of prev) {
+    const existing = incomingById.get(p.id);
+    if (!existing || p.modifiedAt > existing.modifiedAt) {
+      result.set(p.id, p);
+    }
+  }
+  return Array.from(result.values());
+}
 
 export default function App() {
   const [cryptoKey, setCryptoKey] = useState<CryptoKey | null>(null);
@@ -21,11 +41,21 @@ export default function App() {
   const [deviceId, setDeviceId] = useState('');
   const [entries, setEntries] = useState<Entry[]>([]);
   const [conflicts, setConflicts] = useState<ConflictPair[]>([]);
+  const [conflictsDeferred, setConflictsDeferred] = useState(false);
+  const [conflictError, setConflictError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [showSync, setShowSync] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
+
+  // Always reflects the latest committed `entries` state, so handleMerged can
+  // read genuinely current data (not a stale render-time closure) without
+  // needing setEntries' functional-updater form -- which matters here because
+  // handleMerged also needs the same "current entries" value to decide which
+  // ids must be re-persisted to disk (see handleMerged below).
+  const entriesRef = useRef<Entry[]>(entries);
+  entriesRef.current = entries;
 
   useEffect(() => {
     isPinConfigured()
@@ -34,16 +64,21 @@ export default function App() {
     getOrCreateDeviceId()
       .then(setDeviceId)
       .catch(() => setInitError('Could not initialize this device. Please reload the app.'));
-    getPendingConflicts()
-      .then(setConflicts)
-      .catch(() => {});
   }, []);
 
+  // Entries and pending conflicts load together, keyed on cryptoKey (pending
+  // conflicts are encrypted, so they need the key to decrypt too -- see
+  // sync/conflictStore.ts). Loading them in the same effect/Promise.all means
+  // ConflictResolver never has a chance to render before entries have
+  // finished loading: if it could, a user resolving a conflict during that
+  // window would have their resolution reverted the moment the slower
+  // getAllEntries call finally lands and overwrites `entries` wholesale.
   useEffect(() => {
     if (!cryptoKey) return;
-    getAllEntries(cryptoKey)
-      .then((loaded) => {
-        setEntries(loaded);
+    Promise.all([getAllEntries(cryptoKey), getPendingConflicts(cryptoKey)])
+      .then(([loadedEntries, loadedConflicts]) => {
+        setEntries(loadedEntries);
+        setConflicts(loadedConflicts);
       })
       .catch(() =>
         setInitError(
@@ -55,6 +90,15 @@ export default function App() {
   useEffect(() => {
     scheduleEventReminders(entries);
   }, [entries]);
+
+  // Sole writer of persisted pending conflicts: fires whenever `conflicts`
+  // changes, always reflecting the latest state. This replaces scattered
+  // inline setPendingConflicts calls inside state updaters (impure, and
+  // prone to write-ordering races).
+  useEffect(() => {
+    if (!cryptoKey) return;
+    setPendingConflicts(cryptoKey, conflicts).catch(() => {});
+  }, [conflicts, cryptoKey]);
 
   if (initError) return <p role="alert">{initError}</p>;
   if (pinConfigured === null) return null;
@@ -68,27 +112,49 @@ export default function App() {
   const allTags = Array.from(new Set([...nonDeleted.flatMap((e) => e.tags), ...selectedTags]));
 
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
-    setEntries((prev) => {
-      const mergedIds = new Set(merged.map((e) => e.id));
-      const notYetInMerged = prev.filter((e) => !mergedIds.has(e.id));
-      return [...merged, ...notYetInMerged];
-    });
+    const reconciled = reconcileWithLiveState(entriesRef.current, merged);
+    setEntries(reconciled);
+
+    // ImportBackup/syncActions already wrote `merged` to disk via saveEntry
+    // before this callback ran (see ImportBackup.tsx / sync/syncActions.ts).
+    // If `merged` was computed from a stale pre-edit/pre-delete snapshot,
+    // that write left disk holding the stale version even though the live
+    // local version just won reconciliation above. Re-save every entry where
+    // the live version won, so disk matches memory instead of silently
+    // reverting on the next load.
+    const mergedById = new Map(merged.map((e) => [e.id, e]));
+    for (const entry of reconciled) {
+      if (mergedById.get(entry.id) !== entry) {
+        saveEntry(key, entry).catch(() => {});
+      }
+    }
+
     setConflicts((prev) => {
-      const next = [...prev, ...newConflicts];
-      setPendingConflicts(next);
-      return next;
+      // A fresh conflict pair for an id supersedes any older unresolved pair
+      // for that same id (e.g. from an earlier sync session) -- otherwise
+      // resolving the fresh one first can be silently reverted when the
+      // stale duplicate is resolved later.
+      const withoutStaleDuplicates = prev.filter((c) => !newConflicts.some((nc) => nc.local.id === c.local.id));
+      return [...withoutStaleDuplicates, ...newConflicts];
     });
+    if (newConflicts.length > 0) {
+      // Give a freshly-arrived conflict a chance to prompt even if an
+      // earlier batch was deferred.
+      setConflictsDeferred(false);
+    }
   }
 
   async function handleResolve(entry: Entry) {
     const resolved = { ...entry, modifiedAt: Date.now() };
-    await saveEntry(key, resolved);
+    try {
+      await saveEntry(key, resolved);
+    } catch {
+      setConflictError('Could not save your chosen version. Please try again.');
+      return;
+    }
     setEntries((prev) => [...prev.filter((e) => e.id !== resolved.id), resolved]);
-    setConflicts((prev) => {
-      const next = prev.slice(1);
-      setPendingConflicts(next);
-      return next;
-    });
+    setConflicts((prev) => prev.slice(1));
+    setConflictError(null);
   }
 
   async function handleAddNote(rawText: string) {
@@ -156,7 +222,14 @@ export default function App() {
           <button onClick={() => setShowSettings(false)}>Close</button>
         </div>
       )}
-      {conflicts.length > 0 && <ConflictResolver conflicts={conflicts} onResolve={handleResolve} />}
+      {conflicts.length > 0 && !conflictsDeferred && (
+        <ConflictResolver
+          conflicts={conflicts}
+          onResolve={handleResolve}
+          onDefer={() => setConflictsDeferred(true)}
+          error={conflictError}
+        />
+      )}
     </div>
   );
 }
