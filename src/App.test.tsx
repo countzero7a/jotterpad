@@ -342,6 +342,79 @@ describe('App', () => {
     expect(target?.text).toBe('edited during import');
   });
 
+  it('rebuilds a queued conflict pair\'s "local" side from the live entry instead of the stale pre-edit snapshot, so resolving "this device\'s version" keeps the mid-flight edit', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'pre-edit text');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('pre-edit text');
+
+    const key = await deriveTestKey('1234');
+    const [localEntry] = await getAllEntries(key);
+
+    vi.mocked(restoreBackup).mockClear();
+    let resolveRestore!: (entries: Entry[]) => void;
+    vi.mocked(restoreBackup).mockImplementationOnce(
+      () => new Promise<Entry[]>((resolve) => (resolveRestore = resolve))
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await waitFor(() => expect(restoreBackup).toHaveBeenCalled());
+
+    // Edit the entry while the import is paused on a snapshot taken before
+    // this edit -- this is a genuinely more recent local change than what
+    // the in-flight merge is working from.
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('pre-edit text');
+    await user.clear(input);
+    await user.type(input, 'mid-flight edit');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await screen.findByText('mid-flight edit');
+
+    // Resolve the import with a genuinely conflicting remote version of the
+    // SAME entry (same id, different content; both count as "changed since
+    // sync" because ImportBackup's mergeEntries call uses lastSyncAt=0).
+    const remote = {
+      ...localEntry,
+      text: 'remote conflicting version',
+      modifiedAt: localEntry.modifiedAt + 1000,
+      deviceId: 'device-2',
+    };
+    resolveRestore([remote]);
+
+    // The conflict resolver's "this device's version" button must show the
+    // LIVE (mid-flight-edited) text, not the stale pre-edit snapshot
+    // mergeEntries originally saw.
+    await screen.findByText('Conflicting changes');
+    const thisDeviceButton = screen.getByRole('button', { name: /This device's version/ });
+    expect(thisDeviceButton).toHaveTextContent('mid-flight edit');
+    expect(thisDeviceButton).not.toHaveTextContent('pre-edit text');
+
+    await user.click(thisDeviceButton);
+
+    // The final entry must be the mid-flight edit, both in memory and on
+    // disk -- not the stale pre-edit text the conflict pair carried before
+    // this fix, which would otherwise permanently overwrite the rescued
+    // edit with a fresh (and therefore always-winning) modifiedAt.
+    expect(await screen.findByText('mid-flight edit')).toBeInTheDocument();
+    expect(screen.queryByText('pre-edit text')).not.toBeInTheDocument();
+
+    const disk = await getAllEntries(key);
+    const target = disk.find((e) => e.id === localEntry.id);
+    expect(target?.text).toBe('mid-flight edit');
+  });
+
   it('keeps a local delete (tombstone) made during an in-flight import instead of resurrecting the stale version, in memory and on disk', async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -424,6 +497,44 @@ describe('App', () => {
     spy.mockRestore();
   });
 
+  it('does not overwrite persisted pending conflicts with the initial empty array while the entries/conflicts load is still pending', async () => {
+    const key = await setupPin('1234');
+    const { setPendingConflicts, getPendingConflicts } = await import('./sync/conflictStore');
+    const { createNote } = await import('./models/entry');
+    const local = createNote('local version', 'device-1');
+    const remote = createNote('remote version', 'device-2');
+    await setPendingConflicts(key, [{ local, remote }]);
+
+    // Hang the entries load forever, so the load effect's `.then` (which is
+    // the only place `conflictsLoaded` should be able to flip to true) never
+    // runs. This simulates the exact window in which the persistence effect
+    // could otherwise fire with the still-default `conflicts=[]` and clobber
+    // whatever is already in storage, before it's ever been read back in.
+    // This mock hangs forever by design, so it MUST be restored in a
+    // `finally` -- if the assertion below throws before an unconditional
+    // `mockRestore()` runs, every subsequent test in this file would try to
+    // render `<App />` against a permanently-hung `getAllEntries` and fail
+    // for an unrelated reason.
+    const spy = vi.spyOn(entryRepository, 'getAllEntries').mockImplementation(() => new Promise(() => {}));
+
+    try {
+      const user = userEvent.setup();
+      render(<App />);
+      await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+      await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+      // Give the (buggy) persistence effect plenty of real wall-clock time to
+      // fire and write over storage, if it's going to.
+      await waitFor(() => expect(spy).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const stillPersisted = await getPendingConflicts(key);
+      expect(stillPersisted).toEqual([{ local, remote }]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('hides the conflict resolver after clicking "Decide later", without discarding the conflict', async () => {
     const key = await setupPin('1234');
     const { setPendingConflicts } = await import('./sync/conflictStore');
@@ -469,6 +580,74 @@ describe('App', () => {
     expect(screen.getByText(/remote version/)).toBeInTheDocument();
 
     saveSpy.mockRestore();
+  });
+
+  it('surfaces a visible error if re-saving a reconciled entry to disk fails after a merge, instead of silently swallowing it', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'keep my edit for save failure test');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('keep my edit for save failure test');
+
+    vi.mocked(restoreBackup).mockClear();
+    let resolveRestore!: (entries: Entry[]) => void;
+    vi.mocked(restoreBackup).mockImplementationOnce(
+      () => new Promise<Entry[]>((resolve) => (resolveRestore = resolve))
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await waitFor(() => expect(restoreBackup).toHaveBeenCalled());
+
+    // Edit while the import is paused, so handleMerged's reconciliation will
+    // need to re-save this entry (the live edit wins over the stale
+    // snapshot ImportBackup already wrote to disk).
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('keep my edit for save failure test');
+    await user.clear(input);
+    await user.type(input, 'edited but resave will fail');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await screen.findByText('edited but resave will fail');
+
+    // Make ONLY the eventual re-save of this specific entry fail, letting
+    // every other saveEntry call (the edit itself, already done above, and
+    // ImportBackup's own writes of `merged`) go through normally.
+    const actualSaveEntry = entryRepository.saveEntry;
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockImplementation((k, entry) => {
+      if (entry.text === 'edited but resave will fail') {
+        return Promise.reject(new Error('disk full'));
+      }
+      return actualSaveEntry(k, entry);
+    });
+
+    try {
+      const { createNote } = await import('./models/entry');
+      resolveRestore([createNote('remote import note for save failure test', 'device-2')]);
+
+      await screen.findByText('remote import note for save failure test');
+
+      // Settings is open at this point, and ExportSettings always renders
+      // its own unrelated `role="alert"` warning banner -- so match on this
+      // specific message's text rather than querying by role, to avoid
+      // ambiguity between the two.
+      const alertEl = await screen.findByText(/could not save some changes to disk/i);
+      expect(alertEl).toHaveAttribute('role', 'alert');
+      // In-memory state must still reflect the correct reconciled edit even
+      // though the disk re-save failed.
+      expect(screen.getByText('edited but resave will fail')).toBeInTheDocument();
+    } finally {
+      saveSpy.mockRestore();
+    }
   });
 
   it('replaces a stale pending conflict for the same entry id when a fresh conflict arrives for it', async () => {
@@ -519,5 +698,139 @@ describe('App', () => {
     // behind it that could later revert this choice.
     await user.click(screen.getByText(/remote v2/));
     await waitFor(() => expect(screen.queryByText('Conflicting changes')).not.toBeInTheDocument());
+  });
+
+  it('clears a stale conflictError when the user defers, so it does not linger onto the resolver reappearing later', async () => {
+    const key = await setupPin('1234');
+    const { setPendingConflicts } = await import('./sync/conflictStore');
+    const { createNote } = await import('./models/entry');
+    const local = createNote('local version for defer test', 'device-1');
+    const remote = createNote('remote version for defer test', 'device-2');
+    await setPendingConflicts(key, [{ local, remote }]);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockRejectedValueOnce(new Error('disk full'));
+    try {
+      await user.click(await screen.findByText(/local version for defer test/));
+      expect(await screen.findByText(/could not save your chosen version/i)).toBeInTheDocument();
+    } finally {
+      saveSpy.mockRestore();
+    }
+
+    await user.click(screen.getByRole('button', { name: 'Decide later' }));
+    expect(screen.queryByText(/local version for defer test/)).not.toBeInTheDocument();
+
+    // Capture an unrelated note, then bring in an unrelated conflicting
+    // import for it. This flips `conflictsDeferred` back to false, so the
+    // resolver reappears showing the ORIGINAL (unchanged, not superseded)
+    // deferred conflict again -- proving any error-clearing we observe here
+    // came from onDefer itself, not from the separate "fresh conflict
+    // replaces the same id" path (which doesn't apply, since this entry's
+    // id was never touched again).
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'unrelated entry for defer test');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('unrelated entry for defer test');
+
+    const entryKey = await deriveTestKey('1234');
+    const allEntries = await getAllEntries(entryKey);
+    const unrelatedEntry = allEntries.find((e) => e.text === 'unrelated entry for defer test')!;
+    const conflictingRemote = {
+      ...unrelatedEntry,
+      text: 'unrelated remote conflict',
+      modifiedAt: unrelatedEntry.modifiedAt + 1000,
+      deviceId: 'device-3',
+    };
+
+    vi.mocked(restoreBackup).mockClear();
+    vi.mocked(restoreBackup).mockResolvedValueOnce([conflictingRemote]);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+
+    // The resolver reappears showing the original deferred conflict again
+    // (it's still first in the queue), with no stale error attached.
+    // (Settings is open here, and ExportSettings always renders its own
+    // unrelated `role="alert"` warning banner, so check specifically for
+    // the absence of the conflictError text rather than querying by role.)
+    expect(await screen.findByText(/local version for defer test/)).toBeInTheDocument();
+    expect(screen.queryByText(/could not save your chosen version/i)).not.toBeInTheDocument();
+  });
+
+  it('clears a stale conflictError when a fresh conflict replaces the pending one for the same entry id', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'shared entry for error clear test');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('shared entry for error clear test');
+
+    const key = await deriveTestKey('1234');
+    const [localEntry] = await getAllEntries(key);
+
+    const remote1 = {
+      ...localEntry,
+      text: 'remote v1 for error test',
+      modifiedAt: localEntry.modifiedAt + 1000,
+      deviceId: 'device-2',
+    };
+    const remote2 = {
+      ...localEntry,
+      text: 'remote v2 for error test',
+      modifiedAt: localEntry.modifiedAt + 2000,
+      deviceId: 'device-2',
+    };
+
+    vi.mocked(restoreBackup).mockClear();
+    vi.mocked(restoreBackup).mockResolvedValueOnce([remote1]).mockResolvedValueOnce([remote2]);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+
+    const file1 = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup1.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file1);
+    await screen.findByText(/remote v1 for error test/);
+
+    // Make resolving this first conflict fail, so a visible error is queued
+    // alongside it. Settings is already open here, and ExportSettings
+    // always renders its own unrelated `role="alert"` warning banner, so
+    // match on this specific message's text rather than querying by role.
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockRejectedValueOnce(new Error('disk full'));
+    try {
+      await user.click(screen.getByText(/remote v1 for error test/));
+      expect(await screen.findByText(/could not save your chosen version/i)).toBeInTheDocument();
+    } finally {
+      saveSpy.mockRestore();
+    }
+
+    // A fresh conflict for the SAME entry id arrives, superseding the stale
+    // (and still-erroring) one.
+    const file2 = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup2.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file2);
+
+    await screen.findByText(/remote v2 for error test/);
+    // The stale error from resolving the earlier (now-superseded) conflict
+    // must not linger onto this new, unrelated conflict.
+    expect(screen.queryByText(/could not save your chosen version/i)).not.toBeInTheDocument();
   });
 });

@@ -41,8 +41,14 @@ export default function App() {
   const [deviceId, setDeviceId] = useState('');
   const [entries, setEntries] = useState<Entry[]>([]);
   const [conflicts, setConflicts] = useState<ConflictPair[]>([]);
+  // True only once the load effect below has actually populated `conflicts`
+  // from storage. Guards the persistence effect (see below) so it can never
+  // fire with the initial empty `conflicts=[]` before that load has
+  // resolved -- see conflictsLoaded's usage for why that matters.
+  const [conflictsLoaded, setConflictsLoaded] = useState(false);
   const [conflictsDeferred, setConflictsDeferred] = useState(false);
   const [conflictError, setConflictError] = useState<string | null>(null);
+  const [mergeSaveError, setMergeSaveError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [showSync, setShowSync] = useState(false);
@@ -56,6 +62,16 @@ export default function App() {
   // ids must be re-persisted to disk (see handleMerged below).
   const entriesRef = useRef<Entry[]>(entries);
   entriesRef.current = entries;
+
+  // Same reasoning as entriesRef above, for `conflicts`: handleMerged needs
+  // to know the id of the currently-first (displayed) conflict at the exact
+  // moment it runs, not whatever `conflicts` was when the calling
+  // component's render captured this closure. (A functional setConflicts
+  // updater doesn't help here either -- its callback isn't guaranteed to
+  // run synchronously at the call site, so a value it computes can't be read
+  // back out immediately afterward.)
+  const conflictsRef = useRef<ConflictPair[]>(conflicts);
+  conflictsRef.current = conflicts;
 
   useEffect(() => {
     isPinConfigured()
@@ -79,6 +95,7 @@ export default function App() {
       .then(([loadedEntries, loadedConflicts]) => {
         setEntries(loadedEntries);
         setConflicts(loadedConflicts);
+        setConflictsLoaded(true);
       })
       .catch(() =>
         setInitError(
@@ -94,11 +111,17 @@ export default function App() {
   // Sole writer of persisted pending conflicts: fires whenever `conflicts`
   // changes, always reflecting the latest state. This replaces scattered
   // inline setPendingConflicts calls inside state updaters (impure, and
-  // prone to write-ordering races).
+  // prone to write-ordering races). Guarded on `conflictsLoaded` so it can
+  // never fire with the initial `conflicts=[]` before the load effect above
+  // has actually read persisted conflicts back in -- without this guard,
+  // `cryptoKey` becoming available (synchronously, on unlock) always races
+  // ahead of the async `getAllEntries`/`getPendingConflicts` load, so this
+  // effect would otherwise overwrite storage with an empty array before
+  // that load ever resolves (permanently losing it if the load then fails).
   useEffect(() => {
-    if (!cryptoKey) return;
+    if (!cryptoKey || !conflictsLoaded) return;
     setPendingConflicts(cryptoKey, conflicts).catch(() => {});
-  }, [conflicts, cryptoKey]);
+  }, [conflicts, cryptoKey, conflictsLoaded]);
 
   if (initError) return <p role="alert">{initError}</p>;
   if (pinConfigured === null) return null;
@@ -112,7 +135,8 @@ export default function App() {
   const allTags = Array.from(new Set([...nonDeleted.flatMap((e) => e.tags), ...selectedTags]));
 
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
-    const reconciled = reconcileWithLiveState(entriesRef.current, merged);
+    const prev = entriesRef.current;
+    const reconciled = reconcileWithLiveState(prev, merged);
     setEntries(reconciled);
 
     // ImportBackup/syncActions already wrote `merged` to disk via saveEntry
@@ -121,26 +145,66 @@ export default function App() {
     // that write left disk holding the stale version even though the live
     // local version just won reconciliation above. Re-save every entry where
     // the live version won, so disk matches memory instead of silently
-    // reverting on the next load.
+    // reverting on the next load. Surface a visible error if any of these
+    // re-saves fail, instead of silently swallowing it -- memory would still
+    // show the correct reconciled version, but disk would stay stale with no
+    // indication to the user.
     const mergedById = new Map(merged.map((e) => [e.id, e]));
-    for (const entry of reconciled) {
-      if (mergedById.get(entry.id) !== entry) {
-        saveEntry(key, entry).catch(() => {});
-      }
+    const toResave = reconciled.filter((entry) => mergedById.get(entry.id) !== entry);
+    if (toResave.length > 0) {
+      Promise.all(toResave.map((entry) => saveEntry(key, entry))).catch(() => {
+        setMergeSaveError(
+          'Could not save some changes to disk after a merge. Please reload and try again to make sure everything is saved.'
+        );
+      });
     }
 
-    setConflicts((prev) => {
+    // Each queued conflict pair's `local` side must reflect the live entry
+    // state at reconciliation time (the same `prev` used above), not the
+    // stale pre-operation snapshot `mergeEntries` originally saw -- otherwise
+    // resolving "this device's version" later would silently overwrite a
+    // newer local edit/delete that reconciliation just rescued into
+    // `reconciled`/disk, with a fresh `modifiedAt` that would make the
+    // clobbered value win every future comparison too. Fall back to the
+    // pair's own `local` only if that id is no longer present in live state
+    // at all.
+    const liveById = new Map(prev.map((e) => [e.id, e]));
+    const freshConflicts = newConflicts.map((c) => ({
+      ...c,
+      local: liveById.get(c.local.id) ?? c.local,
+    }));
+
+    // ConflictResolver only ever shows/acts on conflicts[0], so a pending
+    // conflictError (from a previously failed resolve attempt) only ever
+    // pertains to that one pair. Determine whether THIS batch replaces that
+    // specific pair using conflictsRef (the true current conflicts at the
+    // moment handleMerged actually runs), not the `conflicts` render
+    // closure -- which could be stale for the same reason `entries` needed
+    // entriesRef above.
+    const currentConflicts = conflictsRef.current;
+    const supersedesCurrentError =
+      currentConflicts.length > 0 && freshConflicts.some((nc) => nc.local.id === currentConflicts[0].local.id);
+
+    setConflicts((prevConflicts) => {
       // A fresh conflict pair for an id supersedes any older unresolved pair
       // for that same id (e.g. from an earlier sync session) -- otherwise
       // resolving the fresh one first can be silently reverted when the
       // stale duplicate is resolved later.
-      const withoutStaleDuplicates = prev.filter((c) => !newConflicts.some((nc) => nc.local.id === c.local.id));
-      return [...withoutStaleDuplicates, ...newConflicts];
+      const withoutStaleDuplicates = prevConflicts.filter(
+        (c) => !freshConflicts.some((nc) => nc.local.id === c.local.id)
+      );
+      return [...withoutStaleDuplicates, ...freshConflicts];
     });
-    if (newConflicts.length > 0) {
+    if (freshConflicts.length > 0) {
       // Give a freshly-arrived conflict a chance to prompt even if an
       // earlier batch was deferred.
       setConflictsDeferred(false);
+    }
+    if (supersedesCurrentError) {
+      // The pair a stale conflictError was about has just been replaced --
+      // drop the error so it doesn't linger and confuse the user about the
+      // fresh pair that replaced it.
+      setConflictError(null);
     }
   }
 
@@ -222,11 +286,19 @@ export default function App() {
           <button onClick={() => setShowSettings(false)}>Close</button>
         </div>
       )}
+      {mergeSaveError && <p role="alert">{mergeSaveError}</p>}
       {conflicts.length > 0 && !conflictsDeferred && (
         <ConflictResolver
           conflicts={conflicts}
           onResolve={handleResolve}
-          onDefer={() => setConflictsDeferred(true)}
+          onDefer={() => {
+            setConflictsDeferred(true);
+            // Don't let a stale error from a previous resolve attempt linger
+            // once the user has stepped away from it -- it would otherwise
+            // still be showing (confusingly attached to a different pair)
+            // the next time the resolver reappears for a fresh conflict.
+            setConflictError(null);
+          }}
           error={conflictError}
         />
       )}
