@@ -106,4 +106,19 @@ describe('LockScreen', () => {
     expect(setupSpy).toHaveBeenCalledTimes(1);
     setupSpy.mockRestore();
   });
+
+  it('allows a second submit after a failed unlock attempt', async () => {
+    await setupPin('4242');
+    const user = userEvent.setup();
+    const onUnlock = vi.fn();
+    render(<LockScreen mode="unlock" onUnlock={onUnlock} />);
+    const input = screen.getByPlaceholderText('PIN');
+    await user.type(input, '0000');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+    await waitFor(() => expect(screen.getByText(/incorrect pin/i)).toBeInTheDocument());
+    await user.clear(input);
+    await user.type(input, '4242');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+    await waitFor(() => expect(onUnlock).toHaveBeenCalledTimes(1), { timeout: 8000 });
+  }, 20000);
 });
