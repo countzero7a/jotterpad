@@ -72,4 +72,17 @@ describe('EntryItem', () => {
     await user.click(screen.getByRole('button', { name: 'Save' }));
     expect(onEdit).not.toHaveBeenCalled();
   });
+
+  it('shows the latest entry text when re-entering edit mode after the entry prop changes', async () => {
+    const user = userEvent.setup();
+    const entry = createNote('milk', 'device-1');
+    const { rerender } = render(<EntryItem entry={entry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+
+    const updatedEntry = { ...entry, text: 'oat milk (from other device)', modifiedAt: entry.modifiedAt + 1 };
+    rerender(<EntryItem entry={updatedEntry} onDelete={vi.fn()} onEdit={vi.fn()} />);
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(screen.getByDisplayValue('oat milk (from other device)')).toBeInTheDocument();
+    expect(screen.queryByDisplayValue('milk')).not.toBeInTheDocument();
+  });
 });

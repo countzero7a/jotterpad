@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Entry } from '../models/entry';
 
 interface EntryItemProps {
@@ -12,6 +12,14 @@ export function EntryItem({ entry, onDelete, onEdit }: EntryItemProps) {
   const [text, setText] = useState(entry.text);
   const [eventDate, setEventDate] = useState(entry.eventDate ?? '');
   const [eventTime, setEventTime] = useState(entry.eventTime ?? '');
+
+  useEffect(() => {
+    if (editing) {
+      setText(entry.text);
+      setEventDate(entry.eventDate ?? '');
+      setEventTime(entry.eventTime ?? '');
+    }
+  }, [editing, entry]);
 
   function handleSave() {
     if (!text.trim()) return;
