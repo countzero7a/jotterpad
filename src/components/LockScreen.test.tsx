@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import 'fake-indexeddb/auto';
@@ -81,5 +81,29 @@ describe('LockScreen', () => {
     const button = screen.getByRole('button', { name: 'Set PIN' });
     await user.click(button);
     expect(button).toBeDisabled();
+  });
+
+  it('only invokes setupPin once when two submits are dispatched in the same tick', async () => {
+    const setupSpy = vi.spyOn(pinModule, 'setupPin');
+    const onUnlock = vi.fn();
+    render(<LockScreen mode="setup" onUnlock={onUnlock} />);
+    fireEvent.change(screen.getByPlaceholderText('PIN'), { target: { value: '1234' } });
+    fireEvent.change(screen.getByPlaceholderText('Confirm PIN'), { target: { value: '1234' } });
+    const button = screen.getByRole('button', { name: 'Set PIN' });
+
+    // Dispatch two submits back-to-back inside a single act() batch, without letting React
+    // commit the first `setSubmitting(true)` in between. This reproduces a same-tick
+    // double-dispatch (e.g. a duplicated click or racing event handlers): both invocations of
+    // handleSubmit's synchronous prelude run against stale `submitting === false` state before
+    // either update is flushed. A guard backed by React state alone cannot detect this; a ref
+    // updates synchronously and does.
+    act(() => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+
+    await waitFor(() => expect(onUnlock).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(setupSpy).toHaveBeenCalledTimes(1);
+    setupSpy.mockRestore();
   });
 });

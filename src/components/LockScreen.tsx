@@ -1,4 +1,4 @@
-import { useState, FormEvent } from 'react';
+import { useState, useRef, FormEvent } from 'react';
 import { setupPin, unlockWithPin } from '../auth/pin';
 
 interface LockScreenProps {
@@ -11,10 +11,15 @@ export function LockScreen({ mode, onUnlock }: LockScreenProps) {
   const [confirmPin, setConfirmPin] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // React state updates are not synchronous: two handleSubmit invocations dispatched within the
+  // same tick can both read `submitting` as false before either commit lands. A ref updates
+  // synchronously, so it genuinely prevents re-entrant double-submits regardless of render timing.
+  const submittingRef = useRef(false);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    if (submitting) return;
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setError('');
     setSubmitting(true);
     try {
@@ -40,6 +45,7 @@ export function LockScreen({ mode, onUnlock }: LockScreenProps) {
     } catch (error) {
       setError('Something went wrong. Please try again.');
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   }
