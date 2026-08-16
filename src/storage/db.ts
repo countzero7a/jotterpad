@@ -35,6 +35,13 @@ export async function setMeta(key: string, value: string): Promise<void> {
   await db.put('meta', value, key);
 }
 
+export async function setMetaEntries(entries: Array<[string, string]>): Promise<void> {
+  const db = await getDb();
+  const tx = db.transaction('meta', 'readwrite');
+  await Promise.all(entries.map(([key, value]) => tx.store.put(value, key)));
+  await tx.done;
+}
+
 export async function getOrCreateDeviceId(): Promise<string> {
   const existing = await getMeta('deviceId');
   if (existing) return existing;

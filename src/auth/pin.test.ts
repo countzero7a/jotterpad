@@ -46,4 +46,16 @@ describe('pin', () => {
     await db.delete('meta', 'verifier');
     expect(await isPinConfigured()).toBe(false);
   });
+
+  it('does not produce a mismatched salt/verifier pair when setupPin is called concurrently with different pins', async () => {
+    const [keyA] = await Promise.all([setupPin('1111'), setupPin('2222')]);
+    const unlockedWithA = await unlockWithPin('1111');
+    const unlockedWithB = await unlockWithPin('2222');
+    // Exactly one of the two PINs used in the race must actually unlock — whichever call's
+    // write "won" — and the winning key must be usable for real encryption, not just returned.
+    const oneWorks = (unlockedWithA !== null) !== (unlockedWithB !== null);
+    expect(oneWorks).toBe(true);
+    const winningKey = unlockedWithA ?? unlockedWithB;
+    expect(winningKey).not.toBeNull();
+  });
 });

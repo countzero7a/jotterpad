@@ -1,5 +1,5 @@
 import { deriveKey, encrypt, decrypt } from '../crypto/crypto';
-import { getMeta, setMeta } from '../storage/db';
+import { getMeta, setMetaEntries } from '../storage/db';
 
 const VERIFIER_PLAINTEXT = 'jotterpad-verify';
 
@@ -12,8 +12,10 @@ export async function isPinConfigured(): Promise<boolean> {
 export async function setupPin(pin: string): Promise<CryptoKey> {
   const { key, salt } = await deriveKey(pin);
   const verifier = await encrypt(key, VERIFIER_PLAINTEXT);
-  await setMeta('salt', salt);
-  await setMeta('verifier', verifier);
+  await setMetaEntries([
+    ['salt', salt],
+    ['verifier', verifier],
+  ]);
   return key;
 }
 
