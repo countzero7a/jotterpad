@@ -234,6 +234,11 @@ describe('App', () => {
     // Pause the import right at the `restoreBackup` call, so the merge's `localEntries`
     // closure is locked in (via ImportBackup's props at the moment Settings was opened,
     // before the capture below happens) while we simulate a note being captured mid-flight.
+    // Clear prior call history first: an earlier test in this file calls the real
+    // restoreBackup through this same shared mock, and without clearing, the
+    // "has it been called yet" check below would already be true before this test
+    // ever uploads anything.
+    vi.mocked(restoreBackup).mockClear();
     let resolveRestore!: (entries: Entry[]) => void;
     vi.mocked(restoreBackup).mockImplementationOnce(
       () => new Promise<Entry[]>((resolve) => (resolveRestore = resolve))
