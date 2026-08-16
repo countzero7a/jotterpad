@@ -55,11 +55,20 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
 
-  // Always reflects the latest committed `entries` state, so handleMerged can
-  // read genuinely current data (not a stale render-time closure) without
-  // needing setEntries' functional-updater form -- which matters here because
-  // handleMerged also needs the same "current entries" value to decide which
-  // ids must be re-persisted to disk (see handleMerged below).
+  // Always reflects the latest `entries` state, so handleMerged can read
+  // genuinely current data without needing setEntries' functional-updater
+  // form -- which matters here because handleMerged also needs the same
+  // "current entries" value to decide which ids must be re-persisted to
+  // disk (see handleMerged below). The render-time assignment below is not
+  // sufficient on its own: in a real browser (unlike this app's test
+  // environment, where interactions are wrapped in `act()` and force a
+  // synchronous flush), a `setEntries` call from an async continuation may
+  // not have been rendered/committed yet by the time a later async
+  // continuation reads `entriesRef.current`, silently reintroducing a
+  // stale-read bug despite this ref's existence. So every `setEntries` call
+  // in this file also assigns `entriesRef.current` synchronously, at the
+  // same point, to the same value -- making the ref authoritative rather
+  // than dependent on render timing.
   const entriesRef = useRef<Entry[]>(entries);
   entriesRef.current = entries;
 
@@ -93,8 +102,32 @@ export default function App() {
     if (!cryptoKey) return;
     Promise.all([getAllEntries(cryptoKey), getPendingConflicts(cryptoKey)])
       .then(([loadedEntries, loadedConflicts]) => {
-        setEntries(loadedEntries);
-        setConflicts(loadedConflicts);
+        // Reconcile against live state instead of overwriting wholesale --
+        // the timeline/capture bar are fully interactive as soon as
+        // cryptoKey is set, before this load resolves, so anything captured
+        // or edited during the load window must survive the load landing
+        // (see reconcileWithLiveState's own doc comment).
+        setEntries((prev) => {
+          const next = reconcileWithLiveState(prev, loadedEntries);
+          entriesRef.current = next;
+          return next;
+        });
+        // Same concern for conflicts: a conflict resolved or newly queued
+        // (e.g. via a merge/import) during the load window must not be
+        // reverted by this load landing. If nothing touched `conflicts`
+        // while we were loading, it's still the initial `[]` and we can
+        // just take the loaded value directly. Otherwise, merge by id:
+        // keep everything already in local state (a local resolve during
+        // the load window already removed its id, and shouldn't be
+        // resurrected by a stale disk read that started before that
+        // resolve), and only append ids the load found that aren't
+        // already accounted for locally.
+        setConflicts((prev) => {
+          if (prev.length === 0) return loadedConflicts;
+          const existingIds = new Set(prev.map((c) => c.local.id));
+          const additions = loadedConflicts.filter((c) => !existingIds.has(c.local.id));
+          return additions.length > 0 ? [...prev, ...additions] : prev;
+        });
         setConflictsLoaded(true);
       })
       .catch(() =>
@@ -120,7 +153,11 @@ export default function App() {
   // that load ever resolves (permanently losing it if the load then fails).
   useEffect(() => {
     if (!cryptoKey || !conflictsLoaded) return;
-    setPendingConflicts(cryptoKey, conflicts).catch(() => {});
+    setPendingConflicts(cryptoKey, conflicts).catch(() =>
+      setMergeSaveError(
+        'Could not save pending conflict changes to disk. Please reload and try again to make sure everything is saved.'
+      )
+    );
   }, [conflicts, cryptoKey, conflictsLoaded]);
 
   if (initError) return <p role="alert">{initError}</p>;
@@ -137,6 +174,7 @@ export default function App() {
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
     const prev = entriesRef.current;
     const reconciled = reconcileWithLiveState(prev, merged);
+    entriesRef.current = reconciled;
     setEntries(reconciled);
 
     // ImportBackup/syncActions already wrote `merged` to disk via saveEntry
@@ -216,27 +254,52 @@ export default function App() {
       setConflictError('Could not save your chosen version. Please try again.');
       return;
     }
-    setEntries((prev) => [...prev.filter((e) => e.id !== resolved.id), resolved]);
-    setConflicts((prev) => prev.slice(1));
+    setEntries((prev) => {
+      const next = [...prev.filter((e) => e.id !== resolved.id), resolved];
+      entriesRef.current = next;
+      return next;
+    });
+    // Dequeue by identity (the specific pair whose local.id matches the
+    // entry just resolved), not by array position. handleResolve is async,
+    // so two overlapping resolve calls (e.g. a double-click before the
+    // first click's save completes -- ConflictResolver has no in-flight/
+    // disabled state) would otherwise both remove whatever is CURRENTLY
+    // first when each one's setConflicts finally runs, which can silently
+    // discard a completely different, still-unresolved conflict pair. This
+    // is safe/idempotent given the existing dedup logic already guarantees
+    // at most one pending conflict per entry id.
+    setConflicts((prev) => prev.filter((c) => c.local.id !== resolved.id));
     setConflictError(null);
   }
 
   async function handleAddNote(rawText: string) {
     const entry = createNote(rawText, deviceId);
     await saveEntry(key, entry);
-    setEntries((prev) => [...prev, entry]);
+    setEntries((prev) => {
+      const next = [...prev, entry];
+      entriesRef.current = next;
+      return next;
+    });
   }
 
   async function handleAddEvent(rawText: string, eventDate: string, eventTime: string) {
     const entry = createEvent(rawText, eventDate, eventTime, deviceId);
     await saveEntry(key, entry);
-    setEntries((prev) => [...prev, entry]);
+    setEntries((prev) => {
+      const next = [...prev, entry];
+      entriesRef.current = next;
+      return next;
+    });
   }
 
   async function handleDelete(id: string) {
     const updated = await deleteEntry(key, entries, id);
     const tombstoned = updated.find((e) => e.id === id);
-    setEntries((prev) => (tombstoned ? prev.map((e) => (e.id === id ? tombstoned : e)) : prev));
+    setEntries((prev) => {
+      const next = tombstoned ? prev.map((e) => (e.id === id ? tombstoned : e)) : prev;
+      entriesRef.current = next;
+      return next;
+    });
   }
 
   async function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
@@ -244,7 +307,11 @@ export default function App() {
     if (!existing) return;
     const updated = updateEntry(existing, rawText, deviceId, eventDate, eventTime);
     await saveEntry(key, updated);
-    setEntries((prev) => prev.map((e) => (e.id === id ? updated : e)));
+    setEntries((prev) => {
+      const next = prev.map((e) => (e.id === id ? updated : e));
+      entriesRef.current = next;
+      return next;
+    });
   }
 
   return (
@@ -286,7 +353,11 @@ export default function App() {
           <button onClick={() => setShowSettings(false)}>Close</button>
         </div>
       )}
-      {mergeSaveError && <p role="alert">{mergeSaveError}</p>}
+      {mergeSaveError && (
+        <p role="alert" className="merge-save-error">
+          {mergeSaveError}
+        </p>
+      )}
       {conflicts.length > 0 && !conflictsDeferred && (
         <ConflictResolver
           conflicts={conflicts}

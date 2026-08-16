@@ -200,6 +200,27 @@ input {
   z-index: 10;
 }
 
+/* mergeSaveError can fire while `.settings`/`.sync-screen` (both
+   position: fixed; inset: 0) are open -- every code path that sets it
+   (import, sync) happens from within one of those overlays. Without its
+   own fixed position + z-index, it would paint underneath as a normal
+   in-flow, non-positioned element and stay invisible until the overlay
+   closes. It stays below `.conflict-resolver`, which must remain on top of
+   everything. */
+.merge-save-error {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  right: 16px;
+  z-index: 5;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
 .qr-display canvas {
   max-width: 100%;
   height: auto;

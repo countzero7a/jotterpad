@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import 'fake-indexeddb/auto';
@@ -10,6 +10,7 @@ import { scheduleEventReminders } from './notifications/reminders';
 import { deriveKey } from './crypto/crypto';
 import { getAllEntries } from './storage/entryRepository';
 import * as entryRepository from './storage/entryRepository';
+import * as conflictStore from './sync/conflictStore';
 import type { Entry } from './models/entry';
 
 // Derives the same CryptoKey the app is using after `setPinThroughUi` set up
@@ -832,5 +833,263 @@ describe('App', () => {
     // The stale error from resolving the earlier (now-superseded) conflict
     // must not linger onto this new, unrelated conflict.
     expect(screen.queryByText(/could not save your chosen version/i)).not.toBeInTheDocument();
+  });
+
+  it('dequeues the correct conflict by identity when two resolve calls overlap, instead of whichever conflict is currently first in the array', async () => {
+    const key = await setupPin('1234');
+    const { setPendingConflicts } = await import('./sync/conflictStore');
+    const { createNote } = await import('./models/entry');
+    const local1 = createNote('local version 1', 'device-1');
+    const remote1 = createNote('remote version 1', 'device-2');
+    const local2 = createNote('local version 2', 'device-1');
+    const remote2 = createNote('remote version 2', 'device-2');
+    await setPendingConflicts(key, [
+      { local: local1, remote: remote1 },
+      { local: local2, remote: remote2 },
+    ]);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+    await screen.findByText(/local version 1/);
+    const thisDeviceButton = screen.getByRole('button', { name: /This device's version/ });
+
+    // Delay saveEntry with a single shared, not-yet-resolved promise. Both
+    // overlapping clicks below will each await THIS SAME promise instance,
+    // so resolving it once lets both handleResolve continuations proceed --
+    // simulating a double-click on the resolver's button before the first
+    // click's save has completed (ConflictResolver has no in-flight/disabled
+    // state to prevent this).
+    let resolveSave!: () => void;
+    const hangingSave = new Promise<void>((resolve) => {
+      resolveSave = () => resolve();
+    });
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockImplementation(() => hangingSave);
+
+    // Two overlapping resolve calls for the SAME (first) conflict pair,
+    // fired without awaiting in between so both are in flight together.
+    fireEvent.click(thisDeviceButton);
+    fireEvent.click(thisDeviceButton);
+
+    resolveSave();
+
+    // Both overlapping calls resolve conflict 1, so its resolver button is
+    // gone either way -- resolved conflict 1 also legitimately reappears as
+    // a normal timeline entry once resolved, so check specifically for the
+    // resolver's button (not just the text anywhere in the document).
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: /This device's version: local version 1/ })
+      ).not.toBeInTheDocument()
+    );
+
+    saveSpy.mockRestore();
+
+    // The second, completely unrelated conflict must still be queued --
+    // the second overlapping resolve call must not have dequeued whatever
+    // happened to be first in the array at that moment (which, by then, was
+    // conflict 2) instead of the conflict it actually resolved (conflict 1).
+    const conflict2Button = await screen.findByRole('button', {
+      name: /This device's version: local version 2/,
+    });
+    expect(conflict2Button).toBeInTheDocument();
+
+    // And it must still be genuinely resolvable, not a dangling duplicate.
+    await user.click(conflict2Button);
+    await waitFor(() => expect(screen.queryByText('Conflicting changes')).not.toBeInTheDocument());
+  });
+
+  it('does not wipe a note captured while the initial entries load is still pending, once the load resolves', async () => {
+    const user = userEvent.setup();
+    let resolveEntries!: (entries: Entry[]) => void;
+    const spy = vi
+      .spyOn(entryRepository, 'getAllEntries')
+      .mockImplementationOnce(() => new Promise<Entry[]>((resolve) => (resolveEntries = resolve)));
+
+    render(<App />);
+    await setPinThroughUi(user);
+
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'captured during initial load');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('captured during initial load');
+
+    // Let the (previously hung) initial load land with an empty snapshot --
+    // a plain `setEntries(loadedEntries)` here would wipe out the capture
+    // that happened while it was still pending.
+    resolveEntries([]);
+
+    // Give the load-effect's setEntries call plenty of real wall-clock time
+    // to land and potentially wipe the capture, if it's going to.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(screen.getByText('captured during initial load')).toBeInTheDocument();
+
+    spy.mockRestore();
+  });
+
+  it('does not drop a conflict added locally (e.g. via import) while the initial entries/conflicts load is still pending, once the load resolves', async () => {
+    const user = userEvent.setup();
+    let resolveEntries!: (entries: Entry[]) => void;
+    const spy = vi
+      .spyOn(entryRepository, 'getAllEntries')
+      .mockImplementationOnce(() => new Promise<Entry[]>((resolve) => (resolveEntries = resolve)));
+
+    render(<App />);
+    await setPinThroughUi(user);
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'shared entry during load');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('shared entry during load');
+
+    // getAllEntries's mockImplementationOnce was already consumed by the
+    // app's own initial-load call above, so this manual call falls through
+    // to the real implementation and reads the entry actually on disk.
+    const key = await deriveTestKey('1234');
+    const disk = await getAllEntries(key);
+    const localEntry = disk.find((e) => e.text === 'shared entry during load')!;
+    const conflictingRemote = {
+      ...localEntry,
+      text: 'remote conflict during load',
+      modifiedAt: localEntry.modifiedAt + 1000,
+      deviceId: 'device-2',
+    };
+
+    vi.mocked(restoreBackup).mockClear();
+    vi.mocked(restoreBackup).mockResolvedValueOnce([conflictingRemote]);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+
+    // The import's merge runs independently of the still-pending initial
+    // load, and queues a fresh conflict for this entry right away.
+    await screen.findByText(/remote conflict during load/);
+
+    // Now let the (previously hung) initial load land. Its own
+    // getPendingConflicts read happened against a disk that has nothing
+    // persisted yet (the persistence effect is still gated on
+    // conflictsLoaded, which this load is about to flip), so a plain
+    // `setConflicts(loadedConflicts)` here would wipe out the conflict that
+    // was just queued in memory by the import above.
+    resolveEntries([]);
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(screen.getByText(/remote conflict during load/)).toBeInTheDocument();
+
+    spy.mockRestore();
+  });
+
+  it('surfaces a visible error if persisting pending conflicts to disk fails, instead of silently swallowing it', async () => {
+    const key = await setupPin('1234');
+    const { setPendingConflicts } = await import('./sync/conflictStore');
+    const { createNote } = await import('./models/entry');
+    const local = createNote('local version for persist failure test', 'device-1');
+    const remote = createNote('remote version for persist failure test', 'device-2');
+    await setPendingConflicts(key, [{ local, remote }]);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+    await screen.findByText(/local version for persist failure test/);
+
+    // Only now (after the initial load has landed and conflictsLoaded is
+    // true) make the persistence write itself fail, so we're specifically
+    // exercising the persistence effect's own error handling.
+    const persistSpy = vi.spyOn(conflictStore, 'setPendingConflicts').mockRejectedValueOnce(new Error('disk full'));
+    try {
+      await user.click(screen.getByText(/local version for persist failure test/));
+
+      expect(await screen.findByText(/could not save.*pending conflict|could not save.*disk/i)).toBeInTheDocument();
+    } finally {
+      persistSpy.mockRestore();
+    }
+  });
+
+  it('does not clear a pending conflictError when an unrelated new conflict for a different entry id arrives (the over-broad "clear on ANY new conflict" behavior would be wrong here)', async () => {
+    const key = await setupPin('1234');
+    const { setPendingConflicts } = await import('./sync/conflictStore');
+    const { createNote } = await import('./models/entry');
+    const local1 = createNote('local version for bug6', 'device-1');
+    const remote1 = createNote('remote version for bug6', 'device-2');
+    await setPendingConflicts(key, [{ local: local1, remote: remote1 }]);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockRejectedValueOnce(new Error('disk full'));
+    try {
+      await user.click(await screen.findByText(/local version for bug6/));
+      expect(await screen.findByText(/could not save your chosen version/i)).toBeInTheDocument();
+    } finally {
+      saveSpy.mockRestore();
+    }
+
+    // conflict1 is still queued (the resolve failed) and still first.
+    expect(screen.getByText(/local version for bug6/)).toBeInTheDocument();
+
+    // Capture an unrelated note and bring in a genuinely conflicting import
+    // for it -- a fresh conflict for a DIFFERENT entry id than the one the
+    // pending error concerns.
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'unrelated note for bug6');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('unrelated note for bug6');
+
+    const entryKey = await deriveTestKey('1234');
+    const allEntries = await getAllEntries(entryKey);
+    const unrelatedEntry = allEntries.find((e) => e.text === 'unrelated note for bug6')!;
+    const conflictingRemote = {
+      ...unrelatedEntry,
+      text: 'unrelated remote conflict for bug6',
+      modifiedAt: unrelatedEntry.modifiedAt + 1000,
+      deviceId: 'device-3',
+    };
+
+    vi.mocked(restoreBackup).mockClear();
+    vi.mocked(restoreBackup).mockResolvedValueOnce([conflictingRemote]);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await screen.findByText('unrelated note for bug6');
+
+    // Give handleMerged's setConflicts call a moment to land.
+    await waitFor(() => expect(vi.mocked(restoreBackup)).toHaveBeenCalled());
+
+    // conflict1 (with its still-pending error) must remain first and the
+    // error must still be shown -- an over-broad "clear on ANY new
+    // conflict" implementation would have wrongly cleared it here, even
+    // though the new conflict is for an entirely unrelated entry.
+    expect(screen.getByText(/local version for bug6/)).toBeInTheDocument();
+    expect(screen.getByText(/could not save your chosen version/i)).toBeInTheDocument();
+
+    // Resolve conflict1 now (the real save succeeds this time), and confirm
+    // the second, previously-hidden conflict surfaces next -- proving it
+    // really was queued behind conflict1, not simply absent. (The resolved
+    // conflict1 text legitimately reappears in the main timeline once
+    // resolved, so check for the next conflict's arrival rather than
+    // conflict1's text disappearing.)
+    await user.click(screen.getByText(/local version for bug6/));
+    expect(await screen.findByText(/unrelated remote conflict for bug6/)).toBeInTheDocument();
   });
 });
