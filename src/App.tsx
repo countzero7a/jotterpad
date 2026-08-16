@@ -68,7 +68,11 @@ export default function App() {
   const allTags = Array.from(new Set([...nonDeleted.flatMap((e) => e.tags), ...selectedTags]));
 
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
-    setEntries(merged);
+    setEntries((prev) => {
+      const mergedIds = new Set(merged.map((e) => e.id));
+      const notYetInMerged = prev.filter((e) => !mergedIds.has(e.id));
+      return [...merged, ...notYetInMerged];
+    });
     setConflicts((prev) => {
       const next = [...prev, ...newConflicts];
       setPendingConflicts(next);

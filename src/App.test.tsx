@@ -7,11 +7,23 @@ import { getDb } from './storage/db';
 import { setupPin } from './auth/pin';
 import { restoreBackup } from './backup/backup';
 import { scheduleEventReminders } from './notifications/reminders';
+import type { Entry } from './models/entry';
 
 vi.mock('./notifications/reminders', () => ({
   scheduleEventReminders: vi.fn(),
   requestNotificationPermission: vi.fn().mockResolvedValue('granted'),
 }));
+
+// Only `restoreBackup` is wrapped so we can pause an in-flight import in one test;
+// by default it still calls through to the real implementation, so every other
+// test (including the export/import round-trip test below) is unaffected.
+vi.mock('./backup/backup', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./backup/backup')>();
+  return {
+    ...actual,
+    restoreBackup: vi.fn(actual.restoreBackup),
+  };
+});
 
 async function resetDb() {
   const db = await getDb();
@@ -212,5 +224,48 @@ describe('App', () => {
 
     expect(await screen.findByText(/local version/)).toBeInTheDocument();
     expect(screen.getByText(/remote version/)).toBeInTheDocument();
+  });
+
+  it('does not drop a note captured while a backup import is still in flight', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    // Pause the import right at the `restoreBackup` call, so the merge's `localEntries`
+    // closure is locked in (via ImportBackup's props at the moment Settings was opened,
+    // before the capture below happens) while we simulate a note being captured mid-flight.
+    let resolveRestore!: (entries: Entry[]) => void;
+    vi.mocked(restoreBackup).mockImplementationOnce(
+      () => new Promise<Entry[]>((resolve) => (resolveRestore = resolve))
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+
+    // Confirm the import is genuinely paused inside restoreBackup before proceeding,
+    // so the race is deterministic rather than timing-dependent.
+    await waitFor(() => expect(restoreBackup).toHaveBeenCalled());
+
+    // Capture a new note while the import is still awaiting restoreBackup. This entry
+    // exists in live `entries` state but was never part of the snapshot the in-flight
+    // merge is working from.
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'captured during import');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('captured during import');
+
+    // Let the import complete with a genuinely new remote entry, proving the merge ran.
+    const { createNote } = await import('./models/entry');
+    resolveRestore([createNote('remote import note', 'device-2')]);
+
+    expect(await screen.findByText('remote import note')).toBeInTheDocument();
+    expect(screen.getByText('captured during import')).toBeInTheDocument();
   });
 });
