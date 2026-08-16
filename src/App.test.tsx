@@ -196,4 +196,21 @@ describe('App', () => {
     const lastCallEntries = calls[calls.length - 1][0];
     expect(lastCallEntries.some((e) => e.text === 'reminder regression note')).toBe(true);
   });
+
+  it('shows a pending conflict that was persisted from a previous session', async () => {
+    const { setPendingConflicts } = await import('./storage/db');
+    const { createNote } = await import('./models/entry');
+    await setupPin('1234');
+    const local = createNote('local version', 'device-1');
+    const remote = createNote('remote version', 'device-2');
+    await setPendingConflicts([{ local, remote }]);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+    expect(await screen.findByText(/local version/)).toBeInTheDocument();
+    expect(screen.getByText(/remote version/)).toBeInTheDocument();
+  });
 });

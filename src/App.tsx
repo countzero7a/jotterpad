@@ -9,7 +9,7 @@ import { ExportSettings } from './components/ExportSettings';
 import { ImportBackup } from './components/ImportBackup';
 import { ReminderSettings } from './components/ReminderSettings';
 import { isPinConfigured } from './auth/pin';
-import { getOrCreateDeviceId } from './storage/db';
+import { getOrCreateDeviceId, getPendingConflicts, setPendingConflicts } from './storage/db';
 import { getAllEntries, saveEntry, deleteEntry } from './storage/entryRepository';
 import { createNote, createEvent, filterEntries, updateEntry, Entry } from './models/entry';
 import { ConflictPair } from './sync/merge';
@@ -34,6 +34,9 @@ export default function App() {
     getOrCreateDeviceId()
       .then(setDeviceId)
       .catch(() => setInitError('Could not initialize this device. Please reload the app.'));
+    getPendingConflicts()
+      .then(setConflicts)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -66,14 +69,22 @@ export default function App() {
 
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
     setEntries(merged);
-    setConflicts((prev) => [...prev, ...newConflicts]);
+    setConflicts((prev) => {
+      const next = [...prev, ...newConflicts];
+      setPendingConflicts(next);
+      return next;
+    });
   }
 
   async function handleResolve(entry: Entry) {
     const resolved = { ...entry, modifiedAt: Date.now() };
     await saveEntry(key, resolved);
     setEntries((prev) => [...prev.filter((e) => e.id !== resolved.id), resolved]);
-    setConflicts((prev) => prev.slice(1));
+    setConflicts((prev) => {
+      const next = prev.slice(1);
+      setPendingConflicts(next);
+      return next;
+    });
   }
 
   async function handleAddNote(rawText: string) {
@@ -124,7 +135,6 @@ export default function App() {
         onDelete={handleDelete}
         onEdit={handleEdit}
       />
-      {conflicts.length > 0 && <ConflictResolver conflicts={conflicts} onResolve={handleResolve} />}
       {showSync && (
         <SyncScreen
           entries={entries}
@@ -142,6 +152,7 @@ export default function App() {
           <button onClick={() => setShowSettings(false)}>Close</button>
         </div>
       )}
+      {conflicts.length > 0 && <ConflictResolver conflicts={conflicts} onResolve={handleResolve} />}
     </div>
   );
 }

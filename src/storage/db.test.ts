@@ -1,6 +1,15 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import 'fake-indexeddb/auto';
-import { getDb, getLastSentAt, setLastSentAt, getLastSyncAt, setLastSyncAt } from './db';
+import {
+  getDb,
+  getLastSentAt,
+  setLastSentAt,
+  getLastSyncAt,
+  setLastSyncAt,
+  getPendingConflicts,
+  setPendingConflicts,
+} from './db';
+import { createNote } from '../models/entry';
 
 async function resetDb() {
   const db = await getDb();
@@ -26,5 +35,25 @@ describe('db watermarks', () => {
     await setLastSentAt(2000);
     expect(await getLastSyncAt()).toBe(1000);
     expect(await getLastSentAt()).toBe(2000);
+  });
+});
+
+describe('pending conflicts', () => {
+  beforeEach(async () => {
+    await resetDb();
+  });
+
+  it('defaults to an empty array before any conflicts are stored', async () => {
+    expect(await getPendingConflicts()).toEqual([]);
+  });
+
+  it('persists and retrieves pending conflicts', async () => {
+    const local = createNote('local version', 'device-1');
+    const remote = createNote('remote version', 'device-2');
+    await setPendingConflicts([{ local, remote }]);
+    const loaded = await getPendingConflicts();
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].local.text).toBe('local version');
+    expect(loaded[0].remote.text).toBe('remote version');
   });
 });
