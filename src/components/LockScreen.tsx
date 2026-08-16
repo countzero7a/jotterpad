@@ -10,10 +10,13 @@ export function LockScreen({ mode, onUnlock }: LockScreenProps) {
   const [pin, setPin] = useState('');
   const [confirmPin, setConfirmPin] = useState('');
   const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
+    if (submitting) return;
     setError('');
+    setSubmitting(true);
     try {
       if (mode === 'setup') {
         if (pin.length < 4) {
@@ -36,6 +39,8 @@ export function LockScreen({ mode, onUnlock }: LockScreenProps) {
       }
     } catch (error) {
       setError('Something went wrong. Please try again.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -65,7 +70,9 @@ export function LockScreen({ mode, onUnlock }: LockScreenProps) {
         />
       )}
       {error && <p>{error}</p>}
-      <button type="submit">{mode === 'setup' ? 'Set PIN' : 'Unlock'}</button>
+      <button type="submit" disabled={submitting}>
+        {mode === 'setup' ? 'Set PIN' : 'Unlock'}
+      </button>
     </form>
   );
 }

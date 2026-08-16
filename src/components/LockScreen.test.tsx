@@ -72,4 +72,14 @@ describe('LockScreen', () => {
     expect(onUnlock).not.toHaveBeenCalled();
     setupSpy.mockRestore();
   });
+
+  it('disables the submit button while a PIN operation is in flight', async () => {
+    const user = userEvent.setup();
+    render(<LockScreen mode="setup" onUnlock={vi.fn()} />);
+    await user.type(screen.getByPlaceholderText('PIN'), '1234');
+    await user.type(screen.getByPlaceholderText('Confirm PIN'), '1234');
+    const button = screen.getByRole('button', { name: 'Set PIN' });
+    await user.click(button);
+    expect(button).toBeDisabled();
+  });
 });
