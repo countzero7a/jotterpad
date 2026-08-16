@@ -55,32 +55,51 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
 
-  // Always reflects the latest `entries` state, so handleMerged can read
-  // genuinely current data without needing setEntries' functional-updater
-  // form -- which matters here because handleMerged also needs the same
-  // "current entries" value to decide which ids must be re-persisted to
-  // disk (see handleMerged below). The render-time assignment below is not
-  // sufficient on its own: in a real browser (unlike this app's test
-  // environment, where interactions are wrapped in `act()` and force a
-  // synchronous flush), a `setEntries` call from an async continuation may
-  // not have been rendered/committed yet by the time a later async
-  // continuation reads `entriesRef.current`, silently reintroducing a
-  // stale-read bug despite this ref's existence. So every `setEntries` call
-  // in this file also assigns `entriesRef.current` synchronously, at the
-  // same point, to the same value -- making the ref authoritative rather
-  // than dependent on render timing.
-  const entriesRef = useRef<Entry[]>(entries);
-  entriesRef.current = entries;
+  // `entriesRef`/`conflictsRef` are the single authoritative source of truth
+  // for reconciliation logic -- they are written ONLY by `commitEntries`/
+  // `commitConflicts` below (synchronously, at the same point `setEntries`/
+  // `setConflicts` is called), and never by a render-time assignment. Prior
+  // versions of this file assigned `entriesRef.current = entries` in the
+  // component body, or wrote the ref from inside a `setEntries` functional
+  // updater's callback -- both of those are timing-dependent: a render-time
+  // assignment only runs on the render *after* a commit lands, and a
+  // functional updater's callback is not guaranteed to run synchronously
+  // when React defers it (its "eager state" optimization, which normally
+  // makes functional updaters resolve synchronously, is disabled whenever
+  // another update is already pending on the fiber -- a common situation
+  // once several async continuations are in flight). Either gap lets
+  // `entriesRef.current`/`conflictsRef.current` still be read as stale by a
+  // later synchronous continuation. Routing every write through one commit
+  // function each closes that gap structurally: the ref update and the
+  // state update happen in the same synchronous call, with no other code
+  // path able to touch the ref, so there is no window in which the ref can
+  // lag behind what was actually committed.
+  const entriesRef = useRef<Entry[]>([]);
+  const conflictsRef = useRef<ConflictPair[]>([]);
+  // Populated by handleResolve (before its commitConflicts call) with the id
+  // of every entry resolved locally this session. The initial load below
+  // must exclude these ids from `loadedConflicts` in addition to whatever is
+  // already present in live `conflicts` -- a conflict resolved during the
+  // load window is no longer present in live state (it was dequeued), so
+  // without this, a slow disk read that started before the resolve would
+  // otherwise resurrect it.
+  const resolvedConflictIdsRef = useRef<Set<string>>(new Set());
 
-  // Same reasoning as entriesRef above, for `conflicts`: handleMerged needs
-  // to know the id of the currently-first (displayed) conflict at the exact
-  // moment it runs, not whatever `conflicts` was when the calling
-  // component's render captured this closure. (A functional setConflicts
-  // updater doesn't help here either -- its callback isn't guaranteed to
-  // run synchronously at the call site, so a value it computes can't be read
-  // back out immediately afterward.)
-  const conflictsRef = useRef<ConflictPair[]>(conflicts);
-  conflictsRef.current = conflicts;
+  // Sole writers of `entries`/`conflicts`. Every other place in this
+  // component that needs to change one of them must funnel through here --
+  // see the ref comment above for why. `next` must always be computed from
+  // `entriesRef.current`/`conflictsRef.current` (never from the `entries`/
+  // `conflicts` state variables captured in a render closure, and never from
+  // a functional updater's `prev` parameter), so callers below always read
+  // and combine from the ref.
+  function commitEntries(next: Entry[]) {
+    entriesRef.current = next;
+    setEntries(next);
+  }
+  function commitConflicts(next: ConflictPair[]) {
+    conflictsRef.current = next;
+    setConflicts(next);
+  }
 
   useEffect(() => {
     isPinConfigured()
@@ -107,27 +126,27 @@ export default function App() {
         // cryptoKey is set, before this load resolves, so anything captured
         // or edited during the load window must survive the load landing
         // (see reconcileWithLiveState's own doc comment).
-        setEntries((prev) => {
-          const next = reconcileWithLiveState(prev, loadedEntries);
-          entriesRef.current = next;
-          return next;
-        });
+        commitEntries(reconcileWithLiveState(entriesRef.current, loadedEntries));
+
         // Same concern for conflicts: a conflict resolved or newly queued
         // (e.g. via a merge/import) during the load window must not be
-        // reverted by this load landing. If nothing touched `conflicts`
-        // while we were loading, it's still the initial `[]` and we can
-        // just take the loaded value directly. Otherwise, merge by id:
-        // keep everything already in local state (a local resolve during
-        // the load window already removed its id, and shouldn't be
-        // resurrected by a stale disk read that started before that
-        // resolve), and only append ids the load found that aren't
-        // already accounted for locally.
-        setConflicts((prev) => {
-          if (prev.length === 0) return loadedConflicts;
-          const existingIds = new Set(prev.map((c) => c.local.id));
-          const additions = loadedConflicts.filter((c) => !existingIds.has(c.local.id));
-          return additions.length > 0 ? [...prev, ...additions] : prev;
-        });
+        // reverted by this load landing. Merge by id: keep everything
+        // already in live `conflicts` (already-queued ids), exclude any id
+        // resolved locally during the load window (resolvedConflictIdsRef --
+        // a local resolve already removed its id from live `conflicts`, so
+        // "not currently present" alone can't distinguish "resolved, don't
+        // resurrect" from "never touched, safe to load"), and only append
+        // ids the load found that clear both exclusions.
+        const currentConflicts = conflictsRef.current;
+        const existingIds = new Set(currentConflicts.map((c) => c.local.id));
+        const additions = loadedConflicts.filter(
+          (c) => !existingIds.has(c.local.id) && !resolvedConflictIdsRef.current.has(c.local.id)
+        );
+        if (currentConflicts.length === 0) {
+          commitConflicts(additions);
+        } else if (additions.length > 0) {
+          commitConflicts([...currentConflicts, ...additions]);
+        }
         setConflictsLoaded(true);
       })
       .catch(() =>
@@ -172,10 +191,14 @@ export default function App() {
   const allTags = Array.from(new Set([...nonDeleted.flatMap((e) => e.tags), ...selectedTags]));
 
   function handleMerged(merged: Entry[], newConflicts: ConflictPair[]) {
+    // A fresh merge attempt supersedes any stale error from a previous one --
+    // otherwise a re-save failure banner from an earlier merge could linger
+    // indefinitely, unrelated to whatever this merge does or doesn't do.
+    setMergeSaveError(null);
+
     const prev = entriesRef.current;
     const reconciled = reconcileWithLiveState(prev, merged);
-    entriesRef.current = reconciled;
-    setEntries(reconciled);
+    commitEntries(reconciled);
 
     // ImportBackup/syncActions already wrote `merged` to disk via saveEntry
     // before this callback ran (see ImportBackup.tsx / sync/syncActions.ts).
@@ -223,16 +246,14 @@ export default function App() {
     const supersedesCurrentError =
       currentConflicts.length > 0 && freshConflicts.some((nc) => nc.local.id === currentConflicts[0].local.id);
 
-    setConflicts((prevConflicts) => {
-      // A fresh conflict pair for an id supersedes any older unresolved pair
-      // for that same id (e.g. from an earlier sync session) -- otherwise
-      // resolving the fresh one first can be silently reverted when the
-      // stale duplicate is resolved later.
-      const withoutStaleDuplicates = prevConflicts.filter(
-        (c) => !freshConflicts.some((nc) => nc.local.id === c.local.id)
-      );
-      return [...withoutStaleDuplicates, ...freshConflicts];
-    });
+    // A fresh conflict pair for an id supersedes any older unresolved pair
+    // for that same id (e.g. from an earlier sync session) -- otherwise
+    // resolving the fresh one first can be silently reverted when the stale
+    // duplicate is resolved later.
+    const withoutStaleDuplicates = currentConflicts.filter(
+      (c) => !freshConflicts.some((nc) => nc.local.id === c.local.id)
+    );
+    commitConflicts([...withoutStaleDuplicates, ...freshConflicts]);
     if (freshConflicts.length > 0) {
       // Give a freshly-arrived conflict a chance to prompt even if an
       // earlier batch was deferred.
@@ -254,64 +275,52 @@ export default function App() {
       setConflictError('Could not save your chosen version. Please try again.');
       return;
     }
-    setEntries((prev) => {
-      const next = [...prev.filter((e) => e.id !== resolved.id), resolved];
-      entriesRef.current = next;
-      return next;
-    });
+    commitEntries([...entriesRef.current.filter((e) => e.id !== resolved.id), resolved]);
+
+    // Record this id as resolved BEFORE dequeuing it, so a still-in-flight
+    // initial load (see the load effect above) can tell "resolved this
+    // session, don't resurrect" apart from "never touched, safe to load".
+    resolvedConflictIdsRef.current.add(resolved.id);
     // Dequeue by identity (the specific pair whose local.id matches the
     // entry just resolved), not by array position. handleResolve is async,
     // so two overlapping resolve calls (e.g. a double-click before the
     // first click's save completes -- ConflictResolver has no in-flight/
     // disabled state) would otherwise both remove whatever is CURRENTLY
-    // first when each one's setConflicts finally runs, which can silently
-    // discard a completely different, still-unresolved conflict pair. This
-    // is safe/idempotent given the existing dedup logic already guarantees
-    // at most one pending conflict per entry id.
-    setConflicts((prev) => prev.filter((c) => c.local.id !== resolved.id));
+    // first when each one's commitConflicts finally runs, which can
+    // silently discard a completely different, still-unresolved conflict
+    // pair. This is safe/idempotent given the existing dedup logic already
+    // guarantees at most one pending conflict per entry id.
+    commitConflicts(conflictsRef.current.filter((c) => c.local.id !== resolved.id));
     setConflictError(null);
   }
 
   async function handleAddNote(rawText: string) {
     const entry = createNote(rawText, deviceId);
     await saveEntry(key, entry);
-    setEntries((prev) => {
-      const next = [...prev, entry];
-      entriesRef.current = next;
-      return next;
-    });
+    commitEntries([...entriesRef.current, entry]);
   }
 
   async function handleAddEvent(rawText: string, eventDate: string, eventTime: string) {
     const entry = createEvent(rawText, eventDate, eventTime, deviceId);
     await saveEntry(key, entry);
-    setEntries((prev) => {
-      const next = [...prev, entry];
-      entriesRef.current = next;
-      return next;
-    });
+    commitEntries([...entriesRef.current, entry]);
   }
 
   async function handleDelete(id: string) {
-    const updated = await deleteEntry(key, entries, id);
+    const updated = await deleteEntry(key, entriesRef.current, id);
     const tombstoned = updated.find((e) => e.id === id);
-    setEntries((prev) => {
-      const next = tombstoned ? prev.map((e) => (e.id === id ? tombstoned : e)) : prev;
-      entriesRef.current = next;
-      return next;
-    });
+    const next = tombstoned
+      ? entriesRef.current.map((e) => (e.id === id ? tombstoned : e))
+      : entriesRef.current;
+    commitEntries(next);
   }
 
   async function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
-    const existing = entries.find((e) => e.id === id);
+    const existing = entriesRef.current.find((e) => e.id === id);
     if (!existing) return;
     const updated = updateEntry(existing, rawText, deviceId, eventDate, eventTime);
     await saveEntry(key, updated);
-    setEntries((prev) => {
-      const next = prev.map((e) => (e.id === id ? updated : e));
-      entriesRef.current = next;
-      return next;
-    });
+    commitEntries(entriesRef.current.map((e) => (e.id === id ? updated : e)));
   }
 
   return (
@@ -356,6 +365,9 @@ export default function App() {
       {mergeSaveError && (
         <p role="alert" className="merge-save-error">
           {mergeSaveError}
+          <button type="button" onClick={() => setMergeSaveError(null)}>
+            Dismiss
+          </button>
         </p>
       )}
       {conflicts.length > 0 && !conflictsDeferred && (

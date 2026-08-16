@@ -205,20 +205,36 @@ input {
    (import, sync) happens from within one of those overlays. Without its
    own fixed position + z-index, it would paint underneath as a normal
    in-flow, non-positioned element and stay invisible until the overlay
-   closes. It stays below `.conflict-resolver`, which must remain on top of
-   everything. */
+   closes. Its z-index must be ABOVE `.conflict-resolver`'s (10), not below
+   it -- a re-save failure is most likely for exactly the entry that's also
+   conflicting, so the two co-occurring is common, not an edge case, and the
+   error must stay visible even then. It's positioned below the header's
+   button row (top: 64px, not top: 16px) because mergeSaveError has no
+   auto-dismiss timer, so it can still be showing after the overlay that
+   triggered it has been closed -- at top: 16px it would sit on top of and
+   permanently block the header's Sync/Settings buttons for the rest of the
+   session. It also carries its own dismiss button (see App.tsx) so the
+   user is never stuck with it. */
 .merge-save-error {
   position: fixed;
-  top: 16px;
+  top: 64px;
   left: 16px;
   right: 16px;
-  z-index: 5;
+  z-index: 15;
   margin: 0;
   padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   background: var(--bg);
   border: 1px solid var(--danger);
   border-radius: 6px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.merge-save-error button {
+  flex-shrink: 0;
 }
 
 .qr-display canvas {
