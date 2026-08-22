@@ -84,6 +84,14 @@ export default function App() {
   // without this, a slow disk read that started before the resolve would
   // otherwise resurrect it.
   const resolvedConflictIdsRef = useRef<Set<string>>(new Set());
+  // Serializes every write the persistence effect below makes to disk.
+  // `setPendingConflicts` internally does `encrypt` (WebCrypto, resolves off
+  // a thread pool with no ordering guarantee) then `setMeta` (an IndexedDB
+  // write) -- so two independently-fired writes can complete in EITHER
+  // order. Without this, an older write finishing after a newer one would
+  // silently overwrite the newer, correct value with stale data (see the
+  // effect's own comment for how this is chained).
+  const pendingConflictsWriteChainRef = useRef<Promise<void>>(Promise.resolve());
 
   // Sole writers of `entries`/`conflicts`. Every other place in this
   // component that needs to change one of them must funnel through here --
@@ -170,13 +178,38 @@ export default function App() {
   // ahead of the async `getAllEntries`/`getPendingConflicts` load, so this
   // effect would otherwise overwrite storage with an empty array before
   // that load ever resolves (permanently losing it if the load then fails).
+  //
+  // Every run is chained onto `pendingConflictsWriteChainRef` instead of
+  // firing an independent, unsequenced write: `setPendingConflicts` does
+  // `encrypt` (WebCrypto, resolves off a thread pool with no ordering
+  // guarantee) then `setMeta` (IndexedDB), so two writes fired close
+  // together (e.g. two resolves in quick succession, which render the
+  // resolver's buttons at the same screen position for the next pair) could
+  // otherwise complete in EITHER order -- if the older one lands after the
+  // newer one, it silently overwrites the newer, correct value with stale
+  // data (a resolved conflict can reappear on the next load, or a fresh
+  // conflict's only remaining copy can be lost for good). Chaining onto the
+  // ref's promise guarantees each write only starts once the previous one
+  // has fully finished, so they can never complete out of order.
+  //
+  // Each queued write also reads `conflictsRef.current` (not the `conflicts`
+  // closure captured when this effect run was scheduled) at the moment it
+  // actually executes. If several changes fire this effect in a burst before
+  // the chain catches up, every write still queued behind the in-flight one
+  // ends up persisting whatever the LATEST value is by the time its turn
+  // comes, collapsing redundant intermediate writes into a single write of
+  // the final state instead of dutifully writing each stale intermediate
+  // value in sequence.
   useEffect(() => {
     if (!cryptoKey || !conflictsLoaded) return;
-    setPendingConflicts(cryptoKey, conflicts).catch(() =>
-      setMergeSaveError(
-        'Could not save pending conflict changes to disk. Please reload and try again to make sure everything is saved.'
-      )
-    );
+    const keyForThisWrite = cryptoKey;
+    pendingConflictsWriteChainRef.current = pendingConflictsWriteChainRef.current
+      .then(() => setPendingConflicts(keyForThisWrite, conflictsRef.current))
+      .catch(() =>
+        setMergeSaveError(
+          'Could not save pending conflict changes to disk. Please reload and try again to make sure everything is saved.'
+        )
+      );
   }, [conflicts, cryptoKey, conflictsLoaded]);
 
   if (initError) return <p role="alert">{initError}</p>;
@@ -306,13 +339,41 @@ export default function App() {
     commitEntries([...entriesRef.current, entry]);
   }
 
+  // Shared by handleDelete/handleEdit below: both already unconditionally
+  // wrote `computed` to disk (via deleteEntry/saveEntry) before this runs,
+  // using a snapshot taken before their own `await`. Reconcile against the
+  // LIVE ref rather than blindly committing `computed`, using the same
+  // reconcileWithLiveState comparison handleMerged already uses for this
+  // class of race: `entriesRef.current` (read now, after the caller's await)
+  // plays the role of the live state, and `[computed]` plays the role of the
+  // (possibly now-stale) result, so a genuinely newer live modifiedAt wins
+  // instead of being silently clobbered.
+  //
+  // If the live version wins, disk is left holding the stale `computed`
+  // value the caller's own save just wrote (or, symmetrically, could yet be
+  // overwritten by a still-in-flight concurrent write finishing after this
+  // one) -- re-save the winning live version so disk converges on the same
+  // value memory just committed to, mirroring handleMerged's own re-save of
+  // entries where the live version wins over an already-disk-written stale
+  // computation.
+  function reconcileAndCommitEntry(computed: Entry, errorMessage: string) {
+    const reconciled = reconcileWithLiveState(entriesRef.current, [computed]);
+    commitEntries(reconciled);
+    const winner = reconciled.find((e) => e.id === computed.id);
+    if (winner && winner !== computed) {
+      saveEntry(key, winner).catch(() => setMergeSaveError(errorMessage));
+    }
+  }
+
   async function handleDelete(id: string) {
-    const updated = await deleteEntry(key, entriesRef.current, id);
+    const before = entriesRef.current;
+    const updated = await deleteEntry(key, before, id);
     const tombstoned = updated.find((e) => e.id === id);
-    const next = tombstoned
-      ? entriesRef.current.map((e) => (e.id === id ? tombstoned : e))
-      : entriesRef.current;
-    commitEntries(next);
+    if (!tombstoned) return;
+    reconcileAndCommitEntry(
+      tombstoned,
+      'Could not save some changes to disk after a delete. Please reload and try again to make sure everything is saved.'
+    );
   }
 
   async function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
@@ -320,7 +381,10 @@ export default function App() {
     if (!existing) return;
     const updated = updateEntry(existing, rawText, deviceId, eventDate, eventTime);
     await saveEntry(key, updated);
-    commitEntries(entriesRef.current.map((e) => (e.id === id ? updated : e)));
+    reconcileAndCommitEntry(
+      updated,
+      'Could not save some changes to disk after an edit. Please reload and try again to make sure everything is saved.'
+    );
   }
 
   return (

@@ -134,6 +134,76 @@ describe('App', () => {
     expect(screen.queryByText('buy milk')).not.toBeInTheDocument();
   });
 
+  it('does not let a slow-to-save edit resurrect an entry that was deleted while the save was still in flight, in memory and on disk', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'race entry text');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('race entry text');
+
+    // Hold the EDIT's own saveEntry call open (matched by its post-edit
+    // text) so handleEdit is still awaiting it when we delete the same
+    // entry below -- every other saveEntry call (including the delete's own
+    // tombstone save) goes through normally.
+    const actualSaveEntry = entryRepository.saveEntry;
+    let resolveEditSave!: () => void;
+    const editSaveGate = new Promise<void>((resolve) => {
+      resolveEditSave = resolve;
+    });
+    let editSaveCompleted = false;
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockImplementation(async (k, entry) => {
+      if (entry.text === 'edited stale text') {
+        await editSaveGate;
+        await actualSaveEntry(k, entry);
+        editSaveCompleted = true;
+        return;
+      }
+      return actualSaveEntry(k, entry);
+    });
+
+    try {
+      await user.click(screen.getByRole('button', { name: 'Edit' }));
+      const input = screen.getByDisplayValue('race entry text');
+      await user.clear(input);
+      await user.type(input, 'edited stale text');
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+
+      // EntryItem's handleSave flips back out of edit mode immediately, not
+      // waiting for the underlying save -- so it re-renders in its normal
+      // view showing the OLD text (App's `entries` state hasn't been
+      // updated by the still-in-flight edit yet), with its Delete button
+      // available again.
+      await screen.findByText('race entry text');
+      await user.click(screen.getByRole('button', { name: 'Delete' }));
+      await waitFor(() => expect(screen.queryByText('race entry text')).not.toBeInTheDocument());
+
+      // Now let the edit's save (paused this whole time, computed from a
+      // pre-delete snapshot) finally complete.
+      resolveEditSave();
+      await waitFor(() => expect(editSaveCompleted).toBe(true));
+      // Give handleEdit's continuation (the commit after its await) a real
+      // chance to run and potentially clobber the delete, if it's going to.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      saveSpy.mockRestore();
+    }
+
+    // The delete must win -- it happened after the edit was initiated, so
+    // it reflects a genuinely newer modifiedAt. The entry must stay
+    // deleted, not be resurrected by the edit's now-stale save landing
+    // after it, in memory or on disk.
+    expect(screen.queryByText('race entry text')).not.toBeInTheDocument();
+    expect(screen.queryByText('edited stale text')).not.toBeInTheDocument();
+
+    const key = await deriveTestKey('1234');
+    const disk = await getAllEntries(key);
+    const target = disk.find((e) => e.text === 'race entry text' || e.text === 'edited stale text');
+    expect(target?.deleted).toBe(true);
+  });
+
   it('gives ExportSettings the full entry list even when a filter hides an entry from the visible timeline', async () => {
     let capturedBlob: Blob | null = null;
     URL.createObjectURL = vi.fn((blob: Blob) => {
@@ -1014,6 +1084,99 @@ describe('App', () => {
       await user.click(screen.getByText(/local version for persist failure test/));
 
       expect(await screen.findByText(/could not save.*pending conflict|could not save.*disk/i)).toBeInTheDocument();
+    } finally {
+      persistSpy.mockRestore();
+    }
+  });
+
+  it('persists the FINAL conflicts state to disk even when an older write completes after a newer one, instead of letting the older write clobber it', async () => {
+    const key = await setupPin('1234');
+    const { setPendingConflicts: realSetPendingConflicts, getPendingConflicts } = await import('./sync/conflictStore');
+    const { createNote } = await import('./models/entry');
+    const localA = createNote('conflict A local', 'device-1');
+    const remoteA = createNote('conflict A remote', 'device-2');
+    const localB = createNote('conflict B local', 'device-1');
+    const remoteB = createNote('conflict B remote', 'device-2');
+    await realSetPendingConflicts(key, [
+      { local: localA, remote: remoteA },
+      { local: localB, remote: remoteB },
+    ]);
+
+    // Wrap (not replace) the real implementation so every write still
+    // actually lands on disk -- we only want to control the RELATIVE TIMING
+    // of when each write's underlying encrypt+setMeta work finishes, to
+    // simulate WebCrypto's lack of ordering guarantee between two in-flight
+    // encrypt() calls.
+    const calls: ConflictPair[][] = [];
+    let completedCount = 0;
+    let releaseSecondWrite!: () => void;
+    const secondWriteGate = new Promise<void>((resolve) => {
+      releaseSecondWrite = resolve;
+    });
+    const persistSpy = vi.spyOn(conflictStore, 'setPendingConflicts').mockImplementation(async (k, c) => {
+      const callNumber = calls.length + 1;
+      calls.push(c);
+      // The SECOND call to setPendingConflicts (the write triggered by
+      // resolving conflict A below) is held open here, so it doesn't
+      // complete until we release it further down -- deliberately AFTER
+      // the third call (resolving conflict B) has already completed and
+      // written its value to disk.
+      if (callNumber === 2) {
+        await secondWriteGate;
+      }
+      await realSetPendingConflicts(k, c);
+      completedCount += 1;
+    });
+
+    try {
+      const user = userEvent.setup();
+      render(<App />);
+      await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+      await user.click(screen.getByRole('button', { name: 'Unlock' }));
+      await screen.findByText(/conflict A local/);
+
+      // Let the initial load-triggered persistence write (a same-value,
+      // effectively no-op write of the two pairs just loaded back in) fully
+      // complete before we start controlling ordering below.
+      await waitFor(() => expect(completedCount).toBe(1));
+
+      // Resolve conflict A. In memory this immediately (and correctly --
+      // prior rounds already fixed this) commits conflicts down to just
+      // [pairB], and kicks off this effect's disk write for that value
+      // (call #2 above), which we're holding open.
+      const resolveAButton = screen.getByRole('button', { name: /This device's version: conflict A local/ });
+      await user.click(resolveAButton);
+      await waitFor(() => expect(calls.length).toBeGreaterThanOrEqual(2));
+
+      // Resolve conflict B immediately after, in quick succession -- before
+      // call #2's write above has completed. In memory this commits
+      // conflicts down to [] right away.
+      const resolveBButton = await screen.findByRole('button', { name: /This device's version: conflict B local/ });
+      await user.click(resolveBButton);
+
+      // Give any unsequenced, fire-and-forget write a real chance to fire
+      // AND complete before we release the gate below -- with the bug,
+      // resolving B fires an independent write immediately (unsequenced
+      // against call #2), so it would complete now while call #2 is still
+      // gated.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Now let the gated call #2 (carrying the stale conflicts=[pairB]
+      // snapshot from when it was queued) finally complete -- simulating it
+      // losing the disk-write race and landing after the newer write.
+      releaseSecondWrite();
+      await waitFor(() => expect(completedCount).toBe(3));
+
+      // Whatever order the writes actually completed in, the FINAL value
+      // persisted on disk must reflect the fully-resolved (empty) conflicts
+      // state -- not whichever write happened to complete last in real
+      // time. With the unsequenced bug, call #2's stale [pairB] snapshot
+      // completes last and overwrites the correct empty state that call #3
+      // already wrote; with writes serialized and each one reading the
+      // latest conflicts at the time it actually runs, call #3 only ever
+      // runs (with the up-to-date value) after call #2 has fully finished.
+      const finalDisk = await getPendingConflicts(key);
+      expect(finalDisk).toEqual([]);
     } finally {
       persistSpy.mockRestore();
     }
