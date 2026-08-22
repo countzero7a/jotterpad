@@ -10,9 +10,9 @@ import { ImportBackup } from './components/ImportBackup';
 import { ReminderSettings } from './components/ReminderSettings';
 import { isPinConfigured } from './auth/pin';
 import { getOrCreateDeviceId } from './storage/db';
-import { getAllEntries, saveEntry, deleteEntry } from './storage/entryRepository';
+import { getAllEntries, saveEntry } from './storage/entryRepository';
 import { getPendingConflicts, setPendingConflicts } from './sync/conflictStore';
-import { createNote, createEvent, filterEntries, updateEntry, Entry } from './models/entry';
+import { createNote, createEvent, filterEntries, updateEntry, markDeleted, Entry } from './models/entry';
 import { ConflictPair } from './sync/merge';
 import { scheduleEventReminders } from './notifications/reminders';
 
@@ -92,6 +92,19 @@ export default function App() {
   // silently overwrite the newer, correct value with stale data (see the
   // effect's own comment for how this is chained).
   const pendingConflictsWriteChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Same problem, generalized PER ENTRY ID: individual entries (not just the
+  // pending-conflicts blob) are also written via `saveEntry`, which has the
+  // identical encrypt-then-IndexedDB-write shape and therefore the identical
+  // no-ordering-guarantee hazard. Two saves for the SAME entry id fired
+  // independently (e.g. a sync's corrective re-save racing a user's own
+  // edit-save) can complete in EITHER order -- an older write landing after
+  // a newer one silently overwrites the newer, correct value on disk with no
+  // error, even though in-memory state (entriesRef) is correct throughout.
+  // Keyed per id (unlike the single conflicts chain above) so writes to
+  // DIFFERENT entries stay independent and don't block each other -- only
+  // writes to the SAME id are serialized against one another. See
+  // `queueEntrySave` below for the write path that chains onto this.
+  const entryWriteChainsRef = useRef<Map<string, Promise<void>>>(new Map());
 
   // Sole writers of `entries`/`conflicts`. Every other place in this
   // component that needs to change one of them must funnel through here --
@@ -107,6 +120,39 @@ export default function App() {
   function commitConflicts(next: ConflictPair[]) {
     conflictsRef.current = next;
     setConflicts(next);
+  }
+
+  // Sole writer of individual entries to disk. Every place below that needs
+  // to persist an entry -- `handleMerged`'s re-save loop,
+  // `reconcileAndCommitEntry` (used by `handleEdit`/`handleDelete`/
+  // `handleResolve`) -- calls this instead of firing its own independent
+  // `saveEntry`, generalizing `pendingConflictsWriteChainRef`'s pattern to
+  // per-entry-id. Chaining onto `entryWriteChainsRef`'s promise for this id
+  // guarantees a write only starts once the previous write for that SAME id
+  // has fully finished, so two writes for the same id can never complete out
+  // of order (writes for different ids are unaffected by each other).
+  // Deliberately takes only an id, not an entry object: it re-reads
+  // `entriesRef.current` at the moment the write actually EXECUTES (not
+  // whatever the caller captured when it queued the write), so a write
+  // queued from a since-stale computation still ends up persisting whatever
+  // is CURRENTLY true by the time its turn comes -- collapsing redundant or
+  // stale queued writes into a single write of the final state, the same
+  // way the pending-conflicts write chain above already does.
+  function queueEntrySave(id: string, key: CryptoKey): Promise<void> {
+    const previous = entryWriteChainsRef.current.get(id) ?? Promise.resolve();
+    const next = previous
+      .then(() => {
+        const latest = entriesRef.current.find((e) => e.id === id);
+        if (!latest) return;
+        return saveEntry(key, latest);
+      })
+      .catch(() =>
+        setMergeSaveError(
+          'Could not save some changes to disk. Please reload and try again to make sure everything is saved.'
+        )
+      );
+    entryWriteChainsRef.current.set(id, next);
+    return next;
   }
 
   useEffect(() => {
@@ -245,13 +291,14 @@ export default function App() {
     // indication to the user.
     const mergedById = new Map(merged.map((e) => [e.id, e]));
     const toResave = reconciled.filter((entry) => mergedById.get(entry.id) !== entry);
-    if (toResave.length > 0) {
-      Promise.all(toResave.map((entry) => saveEntry(key, entry))).catch(() => {
-        setMergeSaveError(
-          'Could not save some changes to disk after a merge. Please reload and try again to make sure everything is saved.'
-        );
-      });
-    }
+    // Route every re-save through the per-id write queue (see
+    // `queueEntrySave`'s doc comment) instead of firing independent,
+    // unsequenced `saveEntry` calls -- otherwise this re-save could complete
+    // AFTER a concurrent write for the same id from an unrelated code path
+    // (e.g. the user's own edit-save for the same entry), silently
+    // overwriting it with this stale pre-merge content. Each call surfaces
+    // its own failure via `queueEntrySave`'s internal catch.
+    toResave.forEach((entry) => queueEntrySave(entry.id, key));
 
     // Each queued conflict pair's `local` side must reflect the live entry
     // state at reconciliation time (the same `prev` used above), not the
@@ -308,7 +355,26 @@ export default function App() {
       setConflictError('Could not save your chosen version. Please try again.');
       return;
     }
-    commitEntries([...entriesRef.current.filter((e) => e.id !== resolved.id), resolved]);
+    // Reconcile against live state instead of committing `resolved`
+    // unconditionally. The entry stays visible/editable/deletable in the
+    // timeline while a conflict for it is pending, and a fresh
+    // sync/merge can also update it directly -- so it may have been
+    // deleted or further edited by something else in the window between
+    // when this conflict was queued and now. Uses the same
+    // last-write-wins-by-modifiedAt rule already applied everywhere else
+    // in this file (reconcileAndCommitEntry -- used by
+    // handleEdit/handleDelete -- and reconcileWithLiveState itself for
+    // handleMerged/the initial load), deliberately NOT a "resolve always
+    // wins" special case: `resolved`'s modifiedAt is stamped fresh right
+    // now, so it already wins against anything that genuinely happened
+    // before this moment. Reconciliation only ever overrides it when
+    // something else has a STRICTLY LATER modifiedAt, which can only
+    // happen if that other change is itself concurrent with this resolve
+    // (e.g. a delete that lands during this function's own `await`
+    // above) -- a genuine race, not something that simply happened
+    // earlier -- which is exactly the case that must not be silently
+    // clobbered.
+    reconcileAndCommitEntry(resolved);
 
     // Record this id as resolved BEFORE dequeuing it, so a still-in-flight
     // initial load (see the load effect above) can tell "resolved this
@@ -329,62 +395,62 @@ export default function App() {
 
   async function handleAddNote(rawText: string) {
     const entry = createNote(rawText, deviceId);
+    // Not routed through queueEntrySave: a freshly generated id can't
+    // possibly be the target of a concurrent write from any other code
+    // path -- nothing else knows this id exists until it's committed to
+    // entriesRef immediately below, so there is no same-id race to close
+    // here. Kept as a direct awaited save (rather than an optimistic
+    // commit-then-save) so the entry only appears once it's actually on
+    // disk, preserving existing behavior.
     await saveEntry(key, entry);
     commitEntries([...entriesRef.current, entry]);
   }
 
   async function handleAddEvent(rawText: string, eventDate: string, eventTime: string) {
     const entry = createEvent(rawText, eventDate, eventTime, deviceId);
+    // Same reasoning as handleAddNote above.
     await saveEntry(key, entry);
     commitEntries([...entriesRef.current, entry]);
   }
 
-  // Shared by handleDelete/handleEdit below: both already unconditionally
-  // wrote `computed` to disk (via deleteEntry/saveEntry) before this runs,
-  // using a snapshot taken before their own `await`. Reconcile against the
-  // LIVE ref rather than blindly committing `computed`, using the same
-  // reconcileWithLiveState comparison handleMerged already uses for this
-  // class of race: `entriesRef.current` (read now, after the caller's await)
-  // plays the role of the live state, and `[computed]` plays the role of the
-  // (possibly now-stale) result, so a genuinely newer live modifiedAt wins
+  // Shared by handleEdit/handleDelete/handleResolve below. Reconciles
+  // `computed` against the LIVE ref rather than committing it
+  // unconditionally, using the same reconcileWithLiveState comparison
+  // handleMerged already uses for this class of race: `entriesRef.current`
+  // plays the role of live state, and `[computed]` plays the role of the
+  // (possibly stale) candidate, so a genuinely newer live modifiedAt wins
   // instead of being silently clobbered.
   //
-  // If the live version wins, disk is left holding the stale `computed`
-  // value the caller's own save just wrote (or, symmetrically, could yet be
-  // overwritten by a still-in-flight concurrent write finishing after this
-  // one) -- re-save the winning live version so disk converges on the same
-  // value memory just committed to, mirroring handleMerged's own re-save of
-  // entries where the live version wins over an already-disk-written stale
-  // computation.
-  function reconcileAndCommitEntry(computed: Entry, errorMessage: string) {
+  // Always queues a re-save of whatever this id's committed value now is
+  // (not just when the live version won reconciliation) via
+  // `queueEntrySave`, which re-reads `entriesRef.current` at its own
+  // execution time rather than saving the `computed`/`winner` value
+  // captured here -- so it always ends up persisting whatever is CURRENTLY
+  // true regardless of which value won, the same "always queue, let the
+  // queue collapse redundant writes" simplification the pending-conflicts
+  // write chain already relies on. This also means every write for this id
+  // -- including the "normal" case where `computed` simply wins outright --
+  // goes through the same serialized per-id queue as any concurrent write
+  // for the same id from another code path (e.g. handleMerged's re-save
+  // loop), instead of being a separate, unsequenced saveEntry call that
+  // could land out of order against one.
+  function reconcileAndCommitEntry(computed: Entry) {
     const reconciled = reconcileWithLiveState(entriesRef.current, [computed]);
     commitEntries(reconciled);
-    const winner = reconciled.find((e) => e.id === computed.id);
-    if (winner && winner !== computed) {
-      saveEntry(key, winner).catch(() => setMergeSaveError(errorMessage));
-    }
+    queueEntrySave(computed.id, key);
   }
 
-  async function handleDelete(id: string) {
-    const before = entriesRef.current;
-    const updated = await deleteEntry(key, before, id);
-    const tombstoned = updated.find((e) => e.id === id);
-    if (!tombstoned) return;
-    reconcileAndCommitEntry(
-      tombstoned,
-      'Could not save some changes to disk after a delete. Please reload and try again to make sure everything is saved.'
-    );
+  function handleDelete(id: string) {
+    const existing = entriesRef.current.find((e) => e.id === id);
+    if (!existing) return;
+    reconcileAndCommitEntry(markDeleted(existing));
   }
 
-  async function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
+  function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
     const existing = entriesRef.current.find((e) => e.id === id);
     if (!existing) return;
     const updated = updateEntry(existing, rawText, deviceId, eventDate, eventTime);
-    await saveEntry(key, updated);
-    reconcileAndCommitEntry(
-      updated,
-      'Could not save some changes to disk after an edit. Please reload and try again to make sure everything is saved.'
-    );
+    reconcileAndCommitEntry(updated);
   }
 
   return (

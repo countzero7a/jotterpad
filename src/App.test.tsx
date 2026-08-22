@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import 'fake-indexeddb/auto';
@@ -134,7 +134,7 @@ describe('App', () => {
     expect(screen.queryByText('buy milk')).not.toBeInTheDocument();
   });
 
-  it('does not let a slow-to-save edit resurrect an entry that was deleted while the save was still in flight, in memory and on disk', async () => {
+  it('commits an edit to the timeline immediately (optimistic UI), and does not let a slow-to-complete disk write for it clobber a delete that happens afterward, in memory or on disk', async () => {
     const user = userEvent.setup();
     render(<App />);
     await setPinThroughUi(user);
@@ -144,18 +144,20 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: 'Add' }));
     await screen.findByText('race entry text');
 
-    // Hold the EDIT's own saveEntry call open (matched by its post-edit
-    // text) so handleEdit is still awaiting it when we delete the same
-    // entry below -- every other saveEntry call (including the delete's own
-    // tombstone save) goes through normally.
+    // Hold open the entry's queued disk write triggered by the edit below
+    // (matched by its post-edit text) -- every other saveEntry call
+    // (including the initial capture's own save, and the delete's own
+    // queued write) goes through normally.
     const actualSaveEntry = entryRepository.saveEntry;
     let resolveEditSave!: () => void;
     const editSaveGate = new Promise<void>((resolve) => {
       resolveEditSave = resolve;
     });
+    let held = false;
     let editSaveCompleted = false;
     const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockImplementation(async (k, entry) => {
-      if (entry.text === 'edited stale text') {
+      if (entry.text === 'edited stale text' && !held) {
+        held = true;
         await editSaveGate;
         await actualSaveEntry(k, entry);
         editSaveCompleted = true;
@@ -171,30 +173,37 @@ describe('App', () => {
       await user.type(input, 'edited stale text');
       await user.click(screen.getByRole('button', { name: 'Save' }));
 
-      // EntryItem's handleSave flips back out of edit mode immediately, not
-      // waiting for the underlying save -- so it re-renders in its normal
-      // view showing the OLD text (App's `entries` state hasn't been
-      // updated by the still-in-flight edit yet), with its Delete button
-      // available again.
-      await screen.findByText('race entry text');
+      // Unlike the old pessimistic (await-the-disk-write-then-commit)
+      // architecture, App now commits an edit to in-memory state
+      // IMMEDIATELY (optimistic UI) and queues its disk write in the
+      // background -- so the edited text shows up right away, with a
+      // Delete button available again, well before its own disk write
+      // (held open above) has completed.
+      await screen.findByText('edited stale text');
       await user.click(screen.getByRole('button', { name: 'Delete' }));
-      await waitFor(() => expect(screen.queryByText('race entry text')).not.toBeInTheDocument());
+      await waitFor(() => expect(screen.queryByText('edited stale text')).not.toBeInTheDocument());
 
-      // Now let the edit's save (paused this whole time, computed from a
-      // pre-delete snapshot) finally complete.
+      // Now let the edit's disk write (paused this whole time, queued
+      // BEFORE the delete's own queued write for the same entry id) finally
+      // complete.
       resolveEditSave();
       await waitFor(() => expect(editSaveCompleted).toBe(true));
-      // Give handleEdit's continuation (the commit after its await) a real
-      // chance to run and potentially clobber the delete, if it's going to.
+      // Give the delete's own queued write -- chained behind the edit's on
+      // the same per-id write queue -- a real chance to run to completion
+      // too, and potentially clobber the delete if it's going to.
       await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
+      // Always release the gate, even if an assertion above threw, so a
+      // dangling held write can't leave IndexedDB mid-transaction for
+      // later tests.
+      resolveEditSave();
       saveSpy.mockRestore();
     }
 
     // The delete must win -- it happened after the edit was initiated, so
     // it reflects a genuinely newer modifiedAt. The entry must stay
-    // deleted, not be resurrected by the edit's now-stale save landing
-    // after it, in memory or on disk.
+    // deleted, not be resurrected by the edit's slow-to-complete write
+    // landing after it, in memory or on disk.
     expect(screen.queryByText('race entry text')).not.toBeInTheDocument();
     expect(screen.queryByText('edited stale text')).not.toBeInTheDocument();
 
@@ -202,6 +211,136 @@ describe('App', () => {
     const disk = await getAllEntries(key);
     const target = disk.find((e) => e.text === 'race entry text' || e.text === 'edited stale text');
     expect(target?.deleted).toBe(true);
+  });
+
+  it('persists the FINAL disk value for an entry even when an older save (the user\'s own earlier edit) completes after a newer one (a concurrent merge\'s re-save), instead of letting the older write clobber it', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'write race base');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('write race base');
+
+    vi.mocked(restoreBackup).mockClear();
+    let resolveRestore!: (entries: Entry[]) => void;
+    vi.mocked(restoreBackup).mockImplementationOnce(
+      () => new Promise<Entry[]>((resolve) => (resolveRestore = resolve))
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await waitFor(() => expect(restoreBackup).toHaveBeenCalled());
+
+    // Edit WHILE the import is paused, on a snapshot taken before this edit
+    // (`localEntries` was fixed at upload time, above) -- this creates
+    // genuine divergence between the live entry and the stale snapshot
+    // `mergeEntries` will see, so handleMerged's reconciliation below finds
+    // live fresher and queues a re-save for it.
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    let input = screen.getByDisplayValue('write race base');
+    await user.clear(input);
+    await user.type(input, 'intermediate state');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await screen.findByText('intermediate state');
+
+    // Hold open the disk write carrying "intermediate state" for this
+    // entry's id -- ImportBackup's own direct save of `merged` (still
+    // holding the STALE pre-edit "write race base" snapshot for this id,
+    // since it was captured at upload time before the edit above) writes a
+    // different text and passes through untouched, so the only call this
+    // matches is handleMerged's own re-save of the reconciled
+    // ("intermediate state") value once the import below resolves, issued
+    // BEFORE the second edit further down. Every other saveEntry call (any
+    // other entry's id, or a later write for this same id) goes through
+    // normally.
+    const actualSaveEntry = entryRepository.saveEntry;
+    let held = false;
+    let resolveFirstWrite!: () => void;
+    const firstWriteGate = new Promise<void>((resolve) => {
+      resolveFirstWrite = resolve;
+    });
+    let firstWriteStarted = false;
+    let firstWriteCompleted = false;
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockImplementation(async (k, entry) => {
+      if (entry.text === 'intermediate state' && !held) {
+        held = true;
+        firstWriteStarted = true;
+        await firstWriteGate;
+        await actualSaveEntry(k, entry);
+        firstWriteCompleted = true;
+        return;
+      }
+      return actualSaveEntry(k, entry);
+    });
+
+    try {
+      const { createNote } = await import('./models/entry');
+      // Resolve the import with an unrelated remote note (a different id),
+      // so this doesn't create a conflict for our entry -- it just leaves
+      // `merged`'s seeded (stale, pre-edit) snapshot for our entry's id in
+      // place, which handleMerged's reconciliation compares against live
+      // state, finds live ("intermediate state") fresher, and queues a
+      // re-save for -- this is the write we're holding open above, ISSUED
+      // FIRST (before the second edit below).
+      resolveRestore([createNote('remote import note for write race', 'device-2')]);
+      await screen.findByText('remote import note for write race');
+      await waitFor(() => expect(firstWriteStarted).toBe(true));
+
+      // A second edit, issued SECOND (after the merge's re-save above was
+      // already queued and is being held open), landing on the SAME entry
+      // id. Committed immediately (optimistic UI) and queues its own write
+      // right behind the still-pending held one. Scoped to this specific
+      // entry's own Edit button, since the timeline now also shows the
+      // freshly-imported "remote import note for write race" entry (also a
+      // note, also with its own Edit button).
+      const targetContainer = screen.getByText('intermediate state').closest('.entry') as HTMLElement;
+      await user.click(within(targetContainer).getByRole('button', { name: 'Edit' }));
+      input = screen.getByDisplayValue('intermediate state');
+      await user.clear(input);
+      await user.type(input, 'final user edit');
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await screen.findByText('final user edit');
+
+      // Give any unsequenced, fire-and-forget write a real chance to fire
+      // AND complete before we release the held write below -- with the
+      // bug, the second edit's own write is unsequenced against the first
+      // (held) one and would complete now, independently.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Now let the held FIRST write -- carrying the stale
+      // "intermediate state" snapshot from when it was queued, issued
+      // BEFORE the second edit -- finally complete, simulating it losing
+      // the disk-write race and landing after the second edit's own write.
+      resolveFirstWrite();
+      await waitFor(() => expect(firstWriteCompleted).toBe(true));
+    } finally {
+      // Always release the gate, even if an assertion above threw, so a
+      // dangling held write can't leave IndexedDB mid-transaction for
+      // later tests.
+      resolveFirstWrite();
+      saveSpy.mockRestore();
+    }
+
+    // Whatever order the underlying writes actually completed in, the
+    // FINAL value persisted on disk must reflect the user's later edit --
+    // not the older, stale re-save that merely happened to be released
+    // last.
+    expect(screen.getByText('final user edit')).toBeInTheDocument();
+    const key = await deriveTestKey('1234');
+    const disk = await getAllEntries(key);
+    const target = disk.find(
+      (e) => e.text === 'final user edit' || e.text === 'intermediate state' || e.text === 'write race base'
+    );
+    expect(target?.text).toBe('final user edit');
   });
 
   it('gives ExportSettings the full entry list even when a filter hides an entry from the visible timeline', async () => {
@@ -652,6 +791,123 @@ describe('App', () => {
     expect(screen.getByText(/remote version/)).toBeInTheDocument();
 
     saveSpy.mockRestore();
+  });
+
+  it('does not resurrect an entry that was deleted while its resolve save was still in flight, in memory or on disk', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'resolve vs delete base');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('resolve vs delete base');
+
+    const key = await deriveTestKey('1234');
+    const [localEntry] = await getAllEntries(key);
+
+    vi.mocked(restoreBackup).mockClear();
+    let resolveRestore!: (entries: Entry[]) => void;
+    vi.mocked(restoreBackup).mockImplementationOnce(
+      () => new Promise<Entry[]>((resolve) => (resolveRestore = resolve))
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await waitFor(() => expect(restoreBackup).toHaveBeenCalled());
+
+    // Edit while the import is paused, then resolve it with a genuinely
+    // conflicting remote version of the SAME entry (same technique as the
+    // "rebuilds a queued conflict pair's local side" test above), so a real
+    // ConflictPair gets queued for this id.
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('resolve vs delete base');
+    await user.clear(input);
+    await user.type(input, 'locally edited before conflict');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await screen.findByText('locally edited before conflict');
+
+    const remote = {
+      ...localEntry,
+      text: 'remote conflicting version',
+      modifiedAt: localEntry.modifiedAt + 1000,
+      deviceId: 'device-2',
+    };
+    resolveRestore([remote]);
+
+    const thisDeviceButton = await screen.findByRole('button', {
+      name: /This device's version: locally edited before conflict/,
+    });
+
+    // Hold open the resolve's own save (matched by its content, the first
+    // such call from here on) so handleResolve is still awaiting it when we
+    // delete the same entry below -- every other saveEntry call (the
+    // delete's own queued write, and its corrective re-save) goes through
+    // normally.
+    const actualSaveEntry = entryRepository.saveEntry;
+    let held = false;
+    let resolveSaveCompleted = false;
+    let releaseResolveSave!: () => void;
+    const resolveSaveGate = new Promise<void>((resolve) => {
+      releaseResolveSave = resolve;
+    });
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockImplementation(async (k, entry) => {
+      if (entry.text === 'locally edited before conflict' && !held) {
+        held = true;
+        await resolveSaveGate;
+        await actualSaveEntry(k, entry);
+        resolveSaveCompleted = true;
+        return;
+      }
+      return actualSaveEntry(k, entry);
+    });
+
+    try {
+      // Click resolve -- this stamps `resolved.modifiedAt = Date.now()`
+      // synchronously and fires its own save, which is now held open.
+      await user.click(thisDeviceButton);
+
+      // While that save is still in flight, delete the entry from the
+      // timeline (still visible/editable while the conflict was pending).
+      // This delete happens strictly AFTER the resolve's own modifiedAt was
+      // stamped, so it is a genuinely more recent change -- a real race,
+      // not something that simply happened earlier.
+      await user.click(await screen.findByRole('button', { name: 'Delete' }));
+      await waitFor(() => expect(screen.queryByText('locally edited before conflict')).not.toBeInTheDocument());
+
+      // Now let the resolve's held save finally complete.
+      releaseResolveSave();
+      await waitFor(() => expect(resolveSaveCompleted).toBe(true));
+      // Give handleResolve's continuation (reconciliation + commit, which
+      // runs after its own save resolves) a real chance to run and
+      // potentially resurrect the delete, if it's going to.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      // Always release the gate, even if an assertion above threw, so a
+      // dangling held write can't leave IndexedDB mid-transaction for
+      // later tests.
+      releaseResolveSave();
+      saveSpy.mockRestore();
+    }
+
+    // The delete happened after the resolve decision was made (during its
+    // own in-flight save), so it must win -- the entry must stay deleted,
+    // not be resurrected by the resolve's save landing after it, in memory
+    // or on disk. The conflict itself must still be gone either way (the
+    // user did make a decision), so the resolver should not reappear.
+    expect(screen.queryByText('locally edited before conflict')).not.toBeInTheDocument();
+    expect(screen.queryByText('Conflicting changes')).not.toBeInTheDocument();
+
+    const disk = await getAllEntries(key);
+    const target = disk.find((e) => e.id === localEntry.id);
+    expect(target?.deleted).toBe(true);
   });
 
   it('surfaces a visible error if re-saving a reconciled entry to disk fails after a merge, instead of silently swallowing it', async () => {
