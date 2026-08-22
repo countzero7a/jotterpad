@@ -213,6 +213,91 @@ describe('App', () => {
     expect(target?.deleted).toBe(true);
   });
 
+  it('lets Edit and Delete take effect on an entry whose live modifiedAt is in this device\'s future (e.g. synced from a peer whose clock runs ahead), instead of silently discarding the user\'s action', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'skew edit target');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('skew edit target');
+    await user.type(captureInput, 'skew delete target');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('skew delete target');
+
+    const key = await deriveTestKey('1234');
+    const localEntries = await getAllEntries(key);
+    const editTarget = localEntries.find((e) => e.text === 'skew edit target')!;
+    const deleteTarget = localEntries.find((e) => e.text === 'skew delete target')!;
+
+    // Simulate both entries having been synced from a peer whose clock runs
+    // ten years ahead of this device's -- same id, IDENTICAL content (so
+    // mergeEntries auto-merges by modifiedAt instead of flagging a
+    // conflict), just a modifiedAt far in this device's future. This is
+    // exactly the shape of entry the bug report describes: nothing here is
+    // a conflict, it's an ordinary sync that happens to carry a
+    // future-dated timestamp.
+    const tenYearsMs = 10 * 365 * 24 * 60 * 60 * 1000;
+    vi.mocked(restoreBackup).mockClear();
+    vi.mocked(restoreBackup).mockResolvedValueOnce([
+      { ...editTarget, modifiedAt: editTarget.modifiedAt + tenYearsMs },
+      { ...deleteTarget, modifiedAt: deleteTarget.modifiedAt + tenYearsMs },
+    ]);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+    const file = new File(
+      [JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })],
+      'backup.json',
+      { type: 'application/json' }
+    );
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await waitFor(async () => {
+      const disk = await getAllEntries(key);
+      expect(disk.find((e) => e.id === editTarget.id)?.modifiedAt).toBeGreaterThan(Date.now());
+      expect(disk.find((e) => e.id === deleteTarget.id)?.modifiedAt).toBeGreaterThan(Date.now());
+    });
+    // Content-identical re-timestamps must not raise a conflict.
+    expect(screen.queryByText('Conflicting changes')).not.toBeInTheDocument();
+
+    // Edit the future-skewed entry.
+    const editContainer = screen.getByText('skew edit target').closest('.entry') as HTMLElement;
+    await user.click(within(editContainer).getByRole('button', { name: 'Edit' }));
+    const input = screen.getByDisplayValue('skew edit target');
+    await user.clear(input);
+    await user.type(input, 'edited despite future skew');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    // The edit must actually take effect -- not be silently discarded
+    // because the live entry's modifiedAt (stamped by the skewed peer) is
+    // ahead of the ordinary Date.now() this edit is stamped with.
+    expect(await screen.findByText('edited despite future skew')).toBeInTheDocument();
+    expect(screen.queryByText('skew edit target')).not.toBeInTheDocument();
+
+    // Delete the other future-skewed entry.
+    const deleteContainer = screen.getByText('skew delete target').closest('.entry') as HTMLElement;
+    await user.click(within(deleteContainer).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(screen.queryByText('skew delete target')).not.toBeInTheDocument());
+
+    // Both must actually be persisted, not just reflected in memory --
+    // `commitEntryDirect`'s disk write is fire-and-forget (queued via
+    // `queueEntrySave`, not awaited by the synchronous handleEdit/
+    // handleDelete handlers), so wait for it to actually land instead of
+    // assuming it already has by this point. This also matters for test
+    // hygiene: without waiting, a slow write could still be in flight when
+    // this test ends and land during a LATER test's run, after that test's
+    // own `resetDb()` has already cleared the (shared, in-memory)
+    // fake-indexeddb -- corrupting it with this test's leftover data.
+    await waitFor(async () => {
+      const disk = await getAllEntries(key);
+      const editedOnDisk = disk.find((e) => e.id === editTarget.id);
+      const deletedOnDisk = disk.find((e) => e.id === deleteTarget.id);
+      expect(editedOnDisk?.text).toBe('edited despite future skew');
+      expect(deletedOnDisk?.deleted).toBe(true);
+    });
+  });
+
   it('persists the FINAL disk value for an entry even when an older save (the user\'s own earlier edit) completes after a newer one (a concurrent merge\'s re-save), instead of letting the older write clobber it', async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -908,6 +993,182 @@ describe('App', () => {
     const disk = await getAllEntries(key);
     const target = disk.find((e) => e.id === localEntry.id);
     expect(target?.deleted).toBe(true);
+  });
+
+  it('does not let a future clock-skewed live entry silently discard the user\'s deliberate resolve choice', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'resolve skew base');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('resolve skew base');
+
+    const key = await deriveTestKey('1234');
+    const [localEntry] = await getAllEntries(key);
+
+    // First, simulate this entry having been synced from a peer whose clock
+    // runs ten years ahead of this device's -- content-identical, so this
+    // is an uncontested auto-merge (not a conflict); it just pushes the
+    // LIVE modifiedAt for this id far into this device's future.
+    const tenYearsMs = 10 * 365 * 24 * 60 * 60 * 1000;
+    vi.mocked(restoreBackup).mockClear();
+    vi.mocked(restoreBackup).mockResolvedValueOnce([{ ...localEntry, modifiedAt: localEntry.modifiedAt + tenYearsMs }]);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+    let file = new File([JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })], 'backup.json', {
+      type: 'application/json',
+    });
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await waitFor(async () => {
+      const disk = await getAllEntries(key);
+      expect(disk.find((e) => e.id === localEntry.id)?.modifiedAt).toBeGreaterThan(Date.now());
+    });
+    expect(screen.queryByText('Conflicting changes')).not.toBeInTheDocument();
+
+    // Now a genuine conflict arrives for the SAME entry: different content,
+    // an ordinary (non-skewed) modifiedAt. The live/local side of this
+    // conflict pair is the future-skewed entry from above.
+    vi.mocked(restoreBackup).mockResolvedValueOnce([
+      { ...localEntry, text: 'remote conflicting version', tags: [], modifiedAt: Date.now(), deviceId: 'device-2' },
+    ]);
+    file = new File([JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })], 'backup2.json', {
+      type: 'application/json',
+    });
+    await user.upload(screen.getByLabelText('backup file'), file);
+
+    const remoteButton = await screen.findByRole('button', {
+      name: /Other device's version: remote conflicting version/,
+    });
+
+    // Pick the REMOTE side -- an ordinary, non-skewed modifiedAt, which is
+    // "behind" the currently-live (skewed) local entry's modifiedAt. This
+    // is exactly the scenario the bug describes: the version the user
+    // picks is timestamp-behind the OTHER, unpicked, still-live version
+    // purely due to clock skew.
+    await user.click(remoteButton);
+
+    // The user's explicit choice must win -- not be silently discarded
+    // because it lost a timestamp comparison against clock skew.
+    expect(await screen.findByText('remote conflicting version')).toBeInTheDocument();
+    expect(screen.queryByText('resolve skew base')).not.toBeInTheDocument();
+    expect(screen.queryByText('Conflicting changes')).not.toBeInTheDocument();
+
+    // `handleResolve`'s own `await saveEntry(...)` guarantees `resolved` is
+    // on disk by the time it commits -- but `reconcileAndCommitEntry` also
+    // fires a further `queueEntrySave` unconditionally (fire-and-forget,
+    // not awaited here), so wait for disk to reflect the final value rather
+    // than assuming that second write already landed. See the Edit/Delete
+    // skew test above for why leaving this un-awaited also risks a
+    // dangling write corrupting a later test's freshly reset db.
+    await waitFor(async () => {
+      const disk = await getAllEntries(key);
+      const target = disk.find((e) => e.id === localEntry.id);
+      expect(target?.text).toBe('remote conflicting version');
+    });
+  });
+
+  it('still lets a genuinely later concurrent change win over a resolve choice, even with the clock-skew fix that keeps resolve from losing to mere skew', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    const captureInput = await screen.findByPlaceholderText('Jot a thought...');
+    await user.type(captureInput, 'resolve genuine race base');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await screen.findByText('resolve genuine race base');
+
+    const key = await deriveTestKey('1234');
+    const [localEntry] = await getAllEntries(key);
+
+    // Skew the live entry into the future, same technique as above.
+    const skew1 = 10 * 365 * 24 * 60 * 60 * 1000; // ~10 years
+    vi.mocked(restoreBackup).mockClear();
+    vi.mocked(restoreBackup).mockResolvedValueOnce([{ ...localEntry, modifiedAt: localEntry.modifiedAt + skew1 }]);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'irrelevant-secret');
+    let file = new File([JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })], 'backup.json', {
+      type: 'application/json',
+    });
+    await user.upload(screen.getByLabelText('backup file'), file);
+    await waitFor(async () => {
+      const disk = await getAllEntries(key);
+      expect(disk.find((e) => e.id === localEntry.id)?.modifiedAt).toBeGreaterThan(Date.now());
+    });
+
+    // A genuine conflict, ordinary-timestamp remote side.
+    vi.mocked(restoreBackup).mockResolvedValueOnce([
+      { ...localEntry, text: 'remote pick', tags: [], modifiedAt: Date.now(), deviceId: 'device-2' },
+    ]);
+    file = new File([JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })], 'backup2.json', {
+      type: 'application/json',
+    });
+    await user.upload(screen.getByLabelText('backup file'), file);
+    const remoteButton = await screen.findByRole('button', { name: /Other device's version: remote pick/ });
+
+    // Hold open the resolve's own save so a genuinely later concurrent
+    // write can land while it's in flight.
+    const actualSaveEntry = entryRepository.saveEntry;
+    let held = false;
+    let resolveSaveCompleted = false;
+    let releaseResolveSave!: () => void;
+    const resolveSaveGate = new Promise<void>((resolve) => {
+      releaseResolveSave = resolve;
+    });
+    const saveSpy = vi.spyOn(entryRepository, 'saveEntry').mockImplementation(async (k, entry) => {
+      if (entry.text === 'remote pick' && !held) {
+        held = true;
+        await resolveSaveGate;
+        await actualSaveEntry(k, entry);
+        resolveSaveCompleted = true;
+        return;
+      }
+      return actualSaveEntry(k, entry);
+    });
+
+    try {
+      await user.click(remoteButton);
+
+      // While the resolve's save is held open, land a GENUINELY later
+      // change on the same id -- content-identical to what's currently
+      // live (still the skewed original, since the resolve hasn't
+      // committed its pick yet) but with an even later modifiedAt
+      // (skew1 + 2000 > skew1), simulating another sync arriving
+      // mid-flight. Both timestamps are explicit constants under the
+      // test's control, so this is a deterministic race, not a
+      // wall-clock timing guess.
+      vi.mocked(restoreBackup).mockResolvedValueOnce([
+        { ...localEntry, modifiedAt: localEntry.modifiedAt + skew1 + 2000 },
+      ]);
+      file = new File([JSON.stringify({ version: 1, salt: 'x', ciphertext: 'y' })], 'backup3.json', {
+        type: 'application/json',
+      });
+      await user.upload(screen.getByLabelText('backup file'), file);
+      await waitFor(async () => {
+        const disk = await getAllEntries(key);
+        expect(disk.find((e) => e.id === localEntry.id)?.modifiedAt).toBe(localEntry.modifiedAt + skew1 + 2000);
+      });
+
+      releaseResolveSave();
+      await waitFor(() => expect(resolveSaveCompleted).toBe(true));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      releaseResolveSave();
+      saveSpy.mockRestore();
+    }
+
+    // The genuinely later change must win -- the resolve's pick must NOT
+    // clobber it, in memory or on disk.
+    expect(screen.queryByText('remote pick')).not.toBeInTheDocument();
+    expect(screen.getByText('resolve genuine race base')).toBeInTheDocument();
+    await waitFor(async () => {
+      const disk = await getAllEntries(key);
+      const target = disk.find((e) => e.id === localEntry.id);
+      expect(target?.modifiedAt).toBe(localEntry.modifiedAt + skew1 + 2000);
+      expect(target?.text).toBe('resolve genuine race base');
+    });
   });
 
   it('surfaces a visible error if re-saving a reconciled entry to disk fails after a merge, instead of silently swallowing it', async () => {

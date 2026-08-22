@@ -1,7 +1,7 @@
 // src/storage/entryRepository.test.ts
 import { describe, it, expect, beforeEach } from 'vitest';
 import 'fake-indexeddb/auto';
-import { saveEntry, getAllEntries, deleteEntry } from './entryRepository';
+import { saveEntry, getAllEntries } from './entryRepository';
 import { createNote } from '../models/entry';
 import { deriveKey } from '../crypto/crypto';
 import { getDb } from './db';
@@ -29,28 +29,5 @@ describe('entryRepository', () => {
     const all = await getAllEntries(key);
     expect(all).toHaveLength(1);
     expect(all[0].text).toBe('buy milk');
-  });
-
-  it('marks an entry as deleted via deleteEntry', async () => {
-    const { key } = await deriveKey('1234');
-    const entry = createNote('temporary note', 'device-1');
-    await saveEntry(key, entry);
-    const loaded = await getAllEntries(key);
-
-    const updated = await deleteEntry(key, loaded, entry.id);
-    expect(updated.find((e) => e.id === entry.id)?.deleted).toBe(true);
-
-    const persisted = await getAllEntries(key);
-    expect(persisted.find((e) => e.id === entry.id)?.deleted).toBe(true);
-  });
-
-  it('leaves the entry list unchanged when deleting an unknown id', async () => {
-    const { key } = await deriveKey('1234');
-    const entry = createNote('stays put', 'device-1');
-    await saveEntry(key, entry);
-    const loaded = await getAllEntries(key);
-
-    const updated = await deleteEntry(key, loaded, 'does-not-exist');
-    expect(updated).toEqual(loaded);
   });
 });

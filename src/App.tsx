@@ -348,7 +348,25 @@ export default function App() {
   }
 
   async function handleResolve(entry: Entry) {
-    const resolved = { ...entry, modifiedAt: Date.now() };
+    // Stamp a MONOTONIC timestamp relative to what's currently live, not a
+    // bare Date.now(). A bare Date.now() can lose the reconciliation below
+    // to the live entry purely because of clock skew: an entry synced from
+    // a peer whose clock runs ahead of this device's can carry a modifiedAt
+    // in this device's future, and Date.now() -- read on THIS device, right
+    // now -- is necessarily behind it. That would silently discard the
+    // user's explicit, deliberate resolve choice (including permanently
+    // losing the unpicked side of the conflict, which exists nowhere else)
+    // for as long as the skew persists -- not a brief race window. Reading
+    // the live version's modifiedAt BEFORE stamping `resolved` and taking
+    // Math.max(Date.now(), liveVersionModifiedAt + 1) guarantees `resolved`
+    // always wins reconciliation against whatever was live at the moment of
+    // resolving, the same high-water-mark reasoning already used for
+    // `markBundleSent` (see sync/syncActions.ts). Falls back to
+    // `entry.modifiedAt` if this id is no longer present in live state at
+    // all (e.g. it was deleted concurrently).
+    const liveVersion = entriesRef.current.find((e) => e.id === entry.id);
+    const liveVersionModifiedAt = liveVersion ? liveVersion.modifiedAt : entry.modifiedAt;
+    const resolved = { ...entry, modifiedAt: Math.max(Date.now(), liveVersionModifiedAt + 1) };
     try {
       await saveEntry(key, resolved);
     } catch {
@@ -362,18 +380,19 @@ export default function App() {
     // deleted or further edited by something else in the window between
     // when this conflict was queued and now. Uses the same
     // last-write-wins-by-modifiedAt rule already applied everywhere else
-    // in this file (reconcileAndCommitEntry -- used by
-    // handleEdit/handleDelete -- and reconcileWithLiveState itself for
+    // in this file (reconcileWithLiveState itself, used for
     // handleMerged/the initial load), deliberately NOT a "resolve always
-    // wins" special case: `resolved`'s modifiedAt is stamped fresh right
-    // now, so it already wins against anything that genuinely happened
-    // before this moment. Reconciliation only ever overrides it when
-    // something else has a STRICTLY LATER modifiedAt, which can only
-    // happen if that other change is itself concurrent with this resolve
-    // (e.g. a delete that lands during this function's own `await`
-    // above) -- a genuine race, not something that simply happened
-    // earlier -- which is exactly the case that must not be silently
-    // clobbered.
+    // wins" special case: `resolved`'s modifiedAt is stamped (per above) to
+    // already exceed whatever was live at the moment this function started,
+    // so it already wins against anything that genuinely happened before
+    // this moment -- including a live entry with a clock-skewed future
+    // timestamp. Reconciliation only ever overrides it when something else
+    // has a STRICTLY LATER modifiedAt than that, which can only happen if
+    // that other change is itself concurrent with this resolve (e.g. a
+    // delete that lands during this function's own `await` above, or a
+    // sync landing an even-later value) -- a genuine race, not something
+    // that simply happened earlier or merely reflects clock skew -- which
+    // is exactly the case that must not be silently clobbered.
     reconcileAndCommitEntry(resolved);
 
     // Record this id as resolved BEFORE dequeuing it, so a still-in-flight
@@ -413,13 +432,21 @@ export default function App() {
     commitEntries([...entriesRef.current, entry]);
   }
 
-  // Shared by handleEdit/handleDelete/handleResolve below. Reconciles
-  // `computed` against the LIVE ref rather than committing it
-  // unconditionally, using the same reconcileWithLiveState comparison
-  // handleMerged already uses for this class of race: `entriesRef.current`
-  // plays the role of live state, and `[computed]` plays the role of the
-  // (possibly stale) candidate, so a genuinely newer live modifiedAt wins
-  // instead of being silently clobbered.
+  // Used SOLELY by handleResolve below (handleEdit/handleDelete used to
+  // route through this too -- see commitEntryDirect's comment for why they
+  // no longer do). Reconciles `computed` against the LIVE ref rather than
+  // committing it unconditionally, using the same reconcileWithLiveState
+  // comparison handleMerged already uses for this class of race:
+  // `entriesRef.current` plays the role of live state, and `[computed]`
+  // plays the role of the (possibly stale) candidate, so a genuinely newer
+  // live modifiedAt wins instead of being silently clobbered. This
+  // reconciliation is still load-bearing for handleResolve specifically:
+  // there is a genuine `await saveEntry(...)` gap between reading live
+  // state (to compute `computed`'s monotonic timestamp) and this call, in
+  // which a concurrent change (e.g. a delete, or another sync/merge) can
+  // land for the same id -- see handleResolve's own comment for how its
+  // timestamp is chosen so this reconciliation only ever loses a GENUINE
+  // race, never merely to clock skew.
   //
   // Always queues a re-save of whatever this id's committed value now is
   // (not just when the live version won reconciliation) via
@@ -440,17 +467,49 @@ export default function App() {
     queueEntrySave(computed.id, key);
   }
 
+  // Used by handleEdit/handleDelete below. Unlike reconcileAndCommitEntry
+  // above (still needed by handleResolve), this commits `computed`
+  // UNCONDITIONALLY -- no "is the live version newer" comparison -- because
+  // for these two callers that comparison is now both unnecessary and
+  // actively harmful:
+  //
+  // - Unnecessary: round 7 restructured handleEdit/handleDelete to be fully
+  //   synchronous, with no `await` between reading entriesRef.current (to
+  //   compute `existing`/`updated`/the tombstone) and this call. `computed`
+  //   is therefore derived from state that is STILL current at the moment
+  //   it is committed -- there is no gap left in which a genuinely
+  //   concurrent write could land, so there is nothing left to reconcile
+  //   against.
+  // - Harmful: an entry synced from a peer whose clock runs ahead of this
+  //   device's can carry a modifiedAt in this device's future. The
+  //   reconciliation this replaces would then always keep the (stale,
+  //   unedited) live entry over `computed` -- which is stamped with an
+  //   ordinary Date.now() and therefore necessarily behind that future
+  //   timestamp -- silently discarding every edit and delete on that entry
+  //   for as long as the clock skew persists. That's a real, deterministic
+  //   regression, not a narrow race window; see this fix's task/report for
+  //   the full writeup.
+  //
+  // Still routes through `queueEntrySave` (not an unsequenced `saveEntry`
+  // call) to keep round 7's per-id disk-write serialization intact -- that
+  // part of the earlier fix is still correct and still needed; only the
+  // "reject if live is newer" gate is gone.
+  function commitEntryDirect(computed: Entry) {
+    commitEntries(entriesRef.current.map((e) => (e.id === computed.id ? computed : e)));
+    queueEntrySave(computed.id, key);
+  }
+
   function handleDelete(id: string) {
     const existing = entriesRef.current.find((e) => e.id === id);
     if (!existing) return;
-    reconcileAndCommitEntry(markDeleted(existing));
+    commitEntryDirect(markDeleted(existing));
   }
 
   function handleEdit(id: string, rawText: string, eventDate?: string, eventTime?: string) {
     const existing = entriesRef.current.find((e) => e.id === id);
     if (!existing) return;
     const updated = updateEntry(existing, rawText, deviceId, eventDate, eventTime);
-    reconcileAndCommitEntry(updated);
+    commitEntryDirect(updated);
   }
 
   return (
