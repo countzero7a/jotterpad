@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Entry } from '../models/entry';
 import { ConflictPair } from '../sync/merge';
-import { prepareOutgoingBundle, applyScannedBundle, markBundleSent, SyncBundle } from '../sync/syncActions';
+import { prepareOutgoingBundle, applyScannedBundle, markBundleSent } from '../sync/syncActions';
+import { isSyncBundle } from '../sync/validate';
 import { QrDisplay } from './QrDisplay';
 import { QrScanner } from './QrScanner';
 
@@ -20,6 +21,7 @@ export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: 
   const [frames, setFrames] = useState<string[]>([]);
   const [sentEntries, setSentEntries] = useState<Entry[]>([]);
   const [preparedAt, setPreparedAt] = useState<number>(0);
+  const [scanError, setScanError] = useState<string | null>(null);
 
   async function startShowing() {
     const {
@@ -34,8 +36,17 @@ export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: 
   }
 
   async function handleScanned(data: unknown) {
-    const { merged, conflicts } = await applyScannedBundle(cryptoKey, entries, data as SyncBundle);
-    onMerged(merged, conflicts);
+    if (!isSyncBundle(data)) {
+      setScanError('That QR sequence was not a valid Jotterpad sync bundle. Try scanning again.');
+      setStep('menu');
+      return;
+    }
+    try {
+      const { merged, conflicts } = await applyScannedBundle(cryptoKey, entries, data);
+      onMerged(merged, conflicts);
+    } catch {
+      setScanError('Something went wrong applying the scanned data. Nothing was changed.');
+    }
     setStep('menu');
   }
 
@@ -50,13 +61,21 @@ export function SyncScreen({ entries, deviceId, cryptoKey, onMerged, onClose }: 
     );
   }
   if (step === 'scanning') {
-    return <QrScanner onComplete={handleScanned} />;
+    return <QrScanner onComplete={handleScanned} onCancel={() => setStep('menu')} />;
   }
   return (
     <div className="sync-screen">
       <button onClick={startShowing}>Show My Changes</button>
-      <button onClick={() => setStep('scanning')}>Scan Partner's Changes</button>
+      <button
+        onClick={() => {
+          setScanError(null);
+          setStep('scanning');
+        }}
+      >
+        Scan Partner's Changes
+      </button>
       <button onClick={onClose}>Close</button>
+      {scanError && <p role="alert">{scanError}</p>}
     </div>
   );
 }

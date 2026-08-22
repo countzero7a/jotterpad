@@ -4,9 +4,10 @@ import { FrameReassembler, parseFrame } from '../sync/qrProtocol';
 
 interface QrScannerProps {
   onComplete: (data: unknown) => void;
+  onCancel: () => void;
 }
 
-export function QrScanner({ onComplete }: QrScannerProps) {
+export function QrScanner({ onComplete, onCancel }: QrScannerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [framesReceived, setFramesReceived] = useState(0);
   const [totalFrames, setTotalFrames] = useState<number | null>(null);
@@ -79,6 +80,7 @@ export function QrScanner({ onComplete }: QrScannerProps) {
   return (
     <div className="qr-scanner">
       <video ref={videoRef} muted playsInline />
+      <button onClick={onCancel}>Cancel</button>
       {error ? (
         <p role="alert">{error}</p>
       ) : (

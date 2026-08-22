@@ -58,4 +58,19 @@ describe('ImportBackup', () => {
 
     expect(await screen.findByText(/could not decrypt/i, {}, { timeout: 5000 })).toBeInTheDocument();
   });
+
+  it('shows an error when the decrypted backup is not a valid entry array', async () => {
+    const backup = await createBackup('correct secret', []);
+    // Tamper with the backup after encryption isn't practical here, so instead simulate a
+    // corrupted decrypted payload by creating a backup whose "entries" were never real Entry
+    // objects — patch restoreBackup's output shape indirectly via a backup created from bad data.
+    const badEntries = [{ bogus: true }] as unknown as Parameters<typeof createBackup>[1];
+    const badBackup = await createBackup('correct secret', badEntries);
+    const { key } = await deriveKey('local-pin');
+    const user = userEvent.setup();
+    render(<ImportBackup cryptoKey={key} localEntries={[]} onImported={vi.fn()} />);
+    await user.type(screen.getByPlaceholderText('PIN or passphrase used for this backup'), 'correct secret');
+    await user.upload(screen.getByLabelText('backup file'), makeFile(JSON.stringify(badBackup)));
+    expect(await screen.findByText(/corrupted or is not a jotterpad backup/i)).toBeInTheDocument();
+  });
 });

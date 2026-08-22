@@ -3,6 +3,7 @@ import { Entry } from '../models/entry';
 import { BackupFile, restoreBackup } from '../backup/backup';
 import { mergeEntries, ConflictPair } from '../sync/merge';
 import { saveEntry } from '../storage/entryRepository';
+import { isEntry } from '../sync/validate';
 
 interface ImportBackupProps {
   cryptoKey: CryptoKey;
@@ -31,6 +32,10 @@ export function ImportBackup({ cryptoKey, localEntries, onImported }: ImportBack
       const text = await readFileAsText(file);
       const backupFile = JSON.parse(text) as BackupFile;
       const imported = await restoreBackup(secret, backupFile);
+      if (!Array.isArray(imported) || !imported.every(isEntry)) {
+        setError('This backup file is corrupted or is not a Jotterpad backup.');
+        return;
+      }
       const { merged, conflicts } = mergeEntries(localEntries, imported, 0);
       for (const entry of merged) {
         await saveEntry(cryptoKey, entry);
