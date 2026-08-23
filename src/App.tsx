@@ -214,6 +214,26 @@ export default function App() {
     scheduleEventReminders(entries);
   }, [entries]);
 
+  // Reminders above are only rescheduled when `entries` itself changes -- but
+  // an event can cross into the 24-hour reminder window purely from time
+  // passing, with the app left open and untouched (no capture/edit/delete/
+  // sync to trigger the effect above). Rescan hourly to catch that case too.
+  // Reads `entriesRef.current` (not the `entries` closure captured when this
+  // effect was set up) so each tick always reschedules against whatever is
+  // CURRENTLY live, the same ref-based discipline used everywhere else in
+  // this file to avoid acting on a stale render closure -- deliberately NOT
+  // `[entries]` in the dependency array with a closure read of `entries`
+  // inside the interval, which would tie the interval's setup/teardown to
+  // entries changing instead of just to mount/unmount.
+  // `scheduleEventReminders`'s own internal registry (Task 13) already makes
+  // repeated calls with the same data a safe no-op re-schedule.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      scheduleEventReminders(entriesRef.current);
+    }, 60 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Sole writer of persisted pending conflicts: fires whenever `conflicts`
   // changes, always reflecting the latest state. This replaces scattered
   // inline setPendingConflicts calls inside state updaters (impure, and
