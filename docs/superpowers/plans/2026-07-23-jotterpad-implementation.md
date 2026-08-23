@@ -4555,6 +4555,318 @@ git commit -m "fix: add PNG app icons for iOS install, auto-scroll the feed, and
 
 ---
 
+## Task 22: Final Whole-Branch Review Follow-ups
+
+**Added after the second whole-branch review**: with all 21 prior tasks assembled, a review that could see cross-task seams (rather than any single task's diff) found four concrete, small, local defects concentrated in the QR sync UI — the layer that had the least direct test coverage and had never been run on real hardware. This task fixes all four: the conflict resolver showing identical text for a delete-vs-edit conflict (user picks blind), the QR display/scan screens having lost their full-screen overlay styling somewhere across the many `SyncScreen` edits, `reminders.ts` using the `Notification` constructor directly (which throws on Chrome for Android — the fix is to prefer the already-registered service worker's `showNotification`), and no way to recover if "Done showing" is tapped before the peer finished scanning (a "resend everything" escape hatch).
+
+**Files:**
+- Modify: `src/components/ConflictResolver.tsx`
+- Modify: `src/components/ConflictResolver.test.tsx`
+- Modify: `src/index.css`
+- Modify: `src/notifications/reminders.ts`
+- Modify: `src/notifications/reminders.test.ts`
+- Modify: `src/App.tsx`
+- Modify: `src/App.test.tsx`
+
+**Interfaces:**
+- Consumes: `Entry` (Task 3); `setLastSentAt` from `src/storage/db.ts` (Task 17).
+- Produces: no new exported signatures — all four fixes are internal to existing components/modules.
+
+- [ ] **Step 1: Write the failing test for ConflictResolver's version descriptions**
+
+```tsx
+// append to src/components/ConflictResolver.test.tsx
+it('distinguishes a deleted version from an edited one with the same text', () => {
+  const local = { ...createNote('shared text', 'device-a'), deleted: true, deletedAt: Date.now() };
+  const remote = createNote('shared text', 'device-b');
+  render(<ConflictResolver conflicts={[{ local, remote }]} onResolve={vi.fn()} onDefer={vi.fn()} />);
+  expect(screen.getByRole('button', { name: /This device's version: \(deleted\)/ })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Other device's version: shared text/ })).toBeInTheDocument();
+});
+
+it('includes the event date/time in the version description for events', () => {
+  const local = createEvent('dentist', '2026-08-01', '09:00', 'device-a');
+  const remote = createEvent('dentist', '2026-08-05', '14:00', 'device-b');
+  render(<ConflictResolver conflicts={[{ local, remote }]} onResolve={vi.fn()} onDefer={vi.fn()} />);
+  expect(screen.getByRole('button', { name: /This device's version: dentist — 2026-08-01 09:00/ })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Other device's version: dentist — 2026-08-05 14:00/ })).toBeInTheDocument();
+});
+```
+
+Add `createEvent` to the existing `import { createNote } from '../models/entry';` line if not already imported.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npm test -- ConflictResolver`
+Expected: FAIL — both buttons currently just render `{current.local.text}`/`{current.remote.text}` with no distinction for deleted/event entries.
+
+- [ ] **Step 3: Add a `describeVersion` helper to `src/components/ConflictResolver.tsx` and use it**
+
+```tsx
+import { ConflictPair } from '../sync/merge';
+import { Entry } from '../models/entry';
+
+interface ConflictResolverProps {
+  conflicts: ConflictPair[];
+  onResolve: (entry: Entry) => void;
+  onDefer: () => void;
+  error?: string | null;
+}
+
+function describeVersion(entry: Entry): string {
+  if (entry.deleted) return '(deleted)';
+  if (entry.type === 'event' && entry.eventDate) {
+    return `${entry.text} — ${entry.eventDate}${entry.eventTime ? ' ' + entry.eventTime : ''}`;
+  }
+  return entry.text;
+}
+
+export function ConflictResolver({ conflicts, onResolve, onDefer, error }: ConflictResolverProps) {
+  if (conflicts.length === 0) return null;
+  const current = conflicts[0];
+  return (
+    <div className="conflict-resolver">
+      <h2>Conflicting changes</h2>
+      <p>This entry was edited on both devices since the last sync. Pick one:</p>
+      {error && <p role="alert">{error}</p>}
+      <button onClick={() => onResolve(current.local)}>
+        This device's version: {describeVersion(current.local)}
+      </button>
+      <button onClick={() => onResolve(current.remote)}>
+        Other device's version: {describeVersion(current.remote)}
+      </button>
+      <button onClick={onDefer}>Decide later</button>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npm test -- ConflictResolver`
+Expected: PASS (all tests, including the two new ones — check the exact current count in the file first)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/components/ConflictResolver.tsx src/components/ConflictResolver.test.tsx
+git commit -m "fix: distinguish deleted and event versions in the conflict resolver"
+```
+
+- [ ] **Step 6: Restore full-screen overlay styling to the QR display and scanner screens**
+
+In `src/components/SyncScreen.tsx`, the `showing`/`scanning` branches return `<QrDisplay .../>`/`<QrScanner .../>` directly (not wrapped in the `.sync-screen` div), so neither ever picked up `.sync-screen`'s `position: fixed; inset: 0` styling — they render as an ordinary flex child squeezed below the timeline instead of a large, full-screen scannable code. In `src/index.css`, add `.qr-display` and `.qr-scanner` to the existing fixed-overlay rule group (keep the existing `.qr-display canvas`/`.qr-scanner video` sizing rules unchanged, just add the two new class names to the shared positioning rule):
+
+```css
+.sync-screen,
+.settings,
+.qr-display,
+.qr-scanner {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+```
+
+This is presentational-only (no component logic changes, no new class names on any component — `QrDisplay`/`QrScanner` already render `className="qr-display"`/`className="qr-scanner"`), so there's no new test — verify with the full suite (unaffected) plus the manual check in Step 12.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/index.css
+git commit -m "fix: restore full-screen overlay styling to the QR display and scanner screens"
+```
+
+- [ ] **Step 8: Write the failing test for the Android-safe notification path**
+
+```ts
+// append to src/notifications/reminders.test.ts
+it('prefers the service worker registration over the Notification constructor when available', () => {
+  const showNotification = vi.fn();
+  // @ts-expect-error test stub for the global navigator.serviceWorker API
+  global.navigator.serviceWorker = { ready: Promise.resolve({ showNotification }) };
+
+  const event = createEvent('dentist', '2026-07-23', '18:00', 'device-1');
+  scheduleEventReminders([event]);
+  vi.advanceTimersByTime(6 * 60 * 60 * 1000 + 1000);
+
+  return Promise.resolve().then(() => {
+    expect(showNotification).toHaveBeenCalledWith('Jotterpad reminder', { body: 'dentist' });
+    expect(notificationSpy).not.toHaveBeenCalled();
+  });
+});
+```
+
+Check the existing test file's `beforeEach` — it already stubs `global.Notification`; this new test additionally stubs `global.navigator.serviceWorker` for just this one case (no need to add it to `beforeEach`, since other tests should keep exercising the plain-`Notification` fallback path).
+
+- [ ] **Step 9: Run tests to verify they fail**
+
+Run: `npm test -- reminders`
+Expected: FAIL — `scheduleEventReminders` currently always calls `new Notification(...)` directly with no service-worker path.
+
+- [ ] **Step 10: Add the service-worker-preferring notification path to `src/notifications/reminders.ts`**
+
+```ts
+import { Entry } from '../models/entry';
+
+export async function requestNotificationPermission(): Promise<NotificationPermission> {
+  if (!('Notification' in window)) return 'denied';
+  return Notification.requestPermission();
+}
+
+async function fireNotification(title: string, body: string): Promise<void> {
+  if ('serviceWorker' in navigator) {
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      if (registration.showNotification) {
+        await registration.showNotification(title, { body });
+        return;
+      }
+    } catch {
+      // fall through to the constructor below
+    }
+  }
+  new Notification(title, { body });
+}
+
+// Tracks currently-pending reminder timers, keyed by entry id, so that
+// repeated calls to scheduleEventReminders (e.g. after every entries reload)
+// don't stack duplicate timers for the same event.
+const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+export function scheduleEventReminders(events: Entry[]): void {
+  scheduledTimers.forEach((timerId) => clearTimeout(timerId));
+  scheduledTimers.clear();
+
+  events
+    .filter((e) => e.type === 'event' && !e.deleted && e.eventDate)
+    .forEach((event) => {
+      const when = new Date(`${event.eventDate}T${event.eventTime || '00:00'}`).getTime();
+      const delay = when - Date.now();
+      if (delay > 0 && delay < 24 * 60 * 60 * 1000) {
+        const timerId = setTimeout(() => {
+          if (Notification.permission === 'granted') {
+            fireNotification('Jotterpad reminder', event.text).catch(() => {});
+          }
+          scheduledTimers.delete(event.id);
+        }, delay);
+        scheduledTimers.set(event.id, timerId);
+      }
+    });
+}
+```
+
+`new Notification(...)` throws directly (an `Illegal constructor` error) on Chrome for Android — it requires notifications to be fired via a `ServiceWorkerRegistration`. Since Jotterpad already registers a service worker (via `vite-plugin-pwa`, from Task 1/21), `navigator.serviceWorker.ready` resolves to that registration once it's active, and `showNotification` is the correct cross-platform API. The plain `new Notification(...)` constructor remains as a fallback for environments without a service worker.
+
+- [ ] **Step 11: Run tests to verify they pass**
+
+Run: `npm test -- reminders`
+Expected: PASS (check the exact current test count in the file first — this adds 1 to whatever it currently is)
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add src/notifications/reminders.ts src/notifications/reminders.test.ts
+git commit -m "fix: fire reminders via the service worker registration, since the Notification constructor throws on Chrome for Android"
+```
+
+- [ ] **Step 13: Add a "resend everything on next sync" escape hatch to Settings**
+
+If a user taps "Done showing" before the peer actually finished scanning (or the peer's scan failed), the shown entries' `modifiedAt` is now at or below `lastSentAt` forever — `selectChangedSince` will never include them in a future outgoing bundle again, unless each one happens to be edited again. This step adds a manual reset so that's recoverable rather than requiring per-entry workarounds.
+
+In `src/App.tsx`, add `setLastSentAt` to the existing `import { getOrCreateDeviceId } from './storage/db';` line (changing it to `import { getOrCreateDeviceId, setLastSentAt } from './storage/db';`). Add a small handler and a confirmation-flash state near the other settings-related handlers:
+
+```tsx
+const [resendConfirmed, setResendConfirmed] = useState(false);
+
+async function handleResendEverything() {
+  await setLastSentAt(0);
+  setResendConfirmed(true);
+}
+```
+
+In the settings panel JSX, add the button and confirmation text right before the existing `Close` button:
+
+```tsx
+{showSettings && (
+  <div className="settings">
+    <ExportSettings entries={entries} />
+    <ImportBackup cryptoKey={cryptoKey} localEntries={entries} onImported={handleMerged} />
+    <ReminderSettings />
+    <div>
+      <button
+        onClick={() => {
+          setResendConfirmed(false);
+          handleResendEverything();
+        }}
+      >
+        Resend everything on next sync
+      </button>
+      <p>
+        If a sync was interrupted or the other device didn't finish scanning, use this to make sure
+        everything gets sent again next time.
+      </p>
+      {resendConfirmed && <p>Done — all your entries will be included in the next sync.</p>}
+    </div>
+    <button onClick={() => setShowSettings(false)}>Close</button>
+  </div>
+)}
+```
+
+- [ ] **Step 14: Write the failing test for the resend button**
+
+```tsx
+// append to src/App.test.tsx
+it('resets the sync watermark so everything resends on the next sync', async () => {
+  const { getLastSentAt, setLastSentAt } = await import('./storage/db');
+  await setupPin('1234');
+  await setLastSentAt(999999999999);
+
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+  await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+  await user.click(await screen.findByRole('button', { name: 'Settings' }));
+  await user.click(screen.getByRole('button', { name: 'Resend everything on next sync' }));
+
+  await screen.findByText(/all your entries will be included/i);
+  expect(await getLastSentAt()).toBe(0);
+});
+```
+
+Check `App.test.tsx`'s existing imports — `setupPin` should already be imported for other tests; add `db`'s `getLastSentAt`/`setLastSentAt` via the dynamic `await import('./storage/db')` pattern already used elsewhere in this file for test-only storage access, to avoid adding a top-level import used only in one test.
+
+- [ ] **Step 15: Run tests to verify they pass**
+
+Run: `npm test -- App`
+Expected: PASS (check the exact current test count in the file first — this adds 1)
+
+- [ ] **Step 16: Run the full suite, typecheck, and build**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run build`
+Expected: all pass, zero type errors, build succeeds.
+
+- [ ] **Step 17: Commit**
+
+```bash
+git add src/App.tsx src/App.test.tsx
+git commit -m "feat: add a resend-everything escape hatch for interrupted syncs"
+```
+
+- [ ] **Step 18: Manual verification**
+
+Run: `npm run build && npm run dev`
+
+In a browser: open Sync and confirm both "Show My Changes" and "Scan Partner's Changes" now render as a proper full-screen view with a large QR code / camera preview, not a squeezed strip below the timeline. Open Settings and confirm the new "Resend everything on next sync" button is present and shows the confirmation text after tapping. (Testing the actual Android-Chrome notification behavior and a real two-device QR sync round-trip both require physical hardware not available in this environment — flagged as still-pending manual verification, as documented in earlier tasks.)
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage:** Overview/architecture → Tasks 1, 14. Security (PIN, encryption, warnings) → Tasks 2, 5, 6, 12. Data model → Task 3. Sync protocol (QR, merge, first-sync-is-full-merge) → Tasks 7, 8, 11. UI (timeline, capture bar, future events, tag/search, lock screen, export/import, reminder caveat) → Tasks 6, 9, 10, 11, 12, 13. Tech stack → Task 1 (scaffold), 11 (qrcode/jsqr). Testing approach (merge + crypto prioritized, QR flow manual) → reflected throughout, explicit in Task 11.
