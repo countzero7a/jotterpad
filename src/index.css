@@ -177,7 +177,9 @@ input {
 }
 
 .sync-screen,
-.settings {
+.settings,
+.qr-display,
+.qr-scanner {
   position: fixed;
   inset: 0;
   background: var(--bg);
