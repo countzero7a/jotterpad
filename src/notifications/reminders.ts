@@ -5,6 +5,21 @@ export async function requestNotificationPermission(): Promise<NotificationPermi
   return Notification.requestPermission();
 }
 
+async function fireNotification(title: string, body: string): Promise<void> {
+  if ('serviceWorker' in navigator) {
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      if (registration.showNotification) {
+        await registration.showNotification(title, { body });
+        return;
+      }
+    } catch {
+      // fall through to the constructor below
+    }
+  }
+  new Notification(title, { body });
+}
+
 // Tracks currently-pending reminder timers, keyed by entry id, so that
 // repeated calls to scheduleEventReminders (e.g. after every entries reload)
 // don't stack duplicate timers for the same event.
@@ -22,7 +37,7 @@ export function scheduleEventReminders(events: Entry[]): void {
       if (delay > 0 && delay < 24 * 60 * 60 * 1000) {
         const timerId = setTimeout(() => {
           if (Notification.permission === 'granted') {
-            new Notification('Jotterpad reminder', { body: event.text });
+            fireNotification('Jotterpad reminder', event.text).catch(() => {});
           }
           scheduledTimers.delete(event.id);
         }, delay);

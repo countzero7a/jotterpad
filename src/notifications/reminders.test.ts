@@ -58,4 +58,19 @@ describe('reminders', () => {
     vi.advanceTimersByTime(6 * 60 * 60 * 1000 + 1000);
     expect(notificationSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('prefers the service worker registration over the Notification constructor when available', () => {
+    const showNotification = vi.fn();
+    // @ts-expect-error test stub for the global navigator.serviceWorker API
+    global.navigator.serviceWorker = { ready: Promise.resolve({ showNotification }) };
+
+    const event = createEvent('dentist', '2026-07-23', '18:00', 'device-1');
+    scheduleEventReminders([event]);
+    vi.advanceTimersByTime(6 * 60 * 60 * 1000 + 1000);
+
+    return Promise.resolve().then(() => {
+      expect(showNotification).toHaveBeenCalledWith('Jotterpad reminder', { body: 'dentist' });
+      expect(notificationSpy).not.toHaveBeenCalled();
+    });
+  });
 });
