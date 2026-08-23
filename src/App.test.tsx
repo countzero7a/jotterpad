@@ -1965,4 +1965,21 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: 'Sync' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument();
   });
+
+  it('resets the sync watermark so everything resends on the next sync', async () => {
+    const { getLastSentAt, setLastSentAt } = await import('./storage/db');
+    await setupPin('1234');
+    await setLastSentAt(999999999999);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByPlaceholderText('PIN'), '1234');
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Resend everything on next sync' }));
+
+    await screen.findByText(/all your entries will be included/i);
+    expect(await getLastSentAt()).toBe(0);
+  });
 });

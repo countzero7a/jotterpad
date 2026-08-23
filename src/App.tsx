@@ -9,7 +9,7 @@ import { ExportSettings } from './components/ExportSettings';
 import { ImportBackup } from './components/ImportBackup';
 import { ReminderSettings } from './components/ReminderSettings';
 import { isPinConfigured } from './auth/pin';
-import { getOrCreateDeviceId } from './storage/db';
+import { getOrCreateDeviceId, setLastSentAt } from './storage/db';
 import { getAllEntries, saveEntry } from './storage/entryRepository';
 import { getPendingConflicts, setPendingConflicts } from './sync/conflictStore';
 import { createNote, createEvent, filterEntries, updateEntry, markDeleted, Entry } from './models/entry';
@@ -54,6 +54,7 @@ export default function App() {
   const [showSync, setShowSync] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
+  const [resendConfirmed, setResendConfirmed] = useState(false);
 
   // `entriesRef`/`conflictsRef` are the single authoritative source of truth
   // for reconciliation logic -- they are written ONLY by `commitEntries`/
@@ -532,6 +533,20 @@ export default function App() {
     commitEntryDirect(updated);
   }
 
+  // Escape hatch for an interrupted sync: if "Done showing" is tapped before
+  // the peer actually finished scanning (or the peer's scan failed), the
+  // shown entries' modifiedAt is now at or below lastSentAt forever --
+  // selectChangedSince would never include them in a future outgoing bundle
+  // again, unless each one happens to be edited again. Resetting the
+  // watermark to 0 makes every entry look "changed since" on the next sync.
+  // Deliberately isolated from entries/conflicts state: it only touches the
+  // lastSentAt value persisted in IndexedDB (via setLastSentAt) and a local
+  // confirmation flag, with no read of or write to entriesRef/conflictsRef.
+  async function handleResendEverything() {
+    await setLastSentAt(0);
+    setResendConfirmed(true);
+  }
+
   return (
     <div className="app">
       <header>
@@ -568,6 +583,21 @@ export default function App() {
           <ExportSettings entries={entries} />
           <ImportBackup cryptoKey={cryptoKey} localEntries={entries} onImported={handleMerged} />
           <ReminderSettings />
+          <div>
+            <button
+              onClick={() => {
+                setResendConfirmed(false);
+                handleResendEverything();
+              }}
+            >
+              Resend everything on next sync
+            </button>
+            <p>
+              If a sync was interrupted or the other device didn't finish scanning, use this to make sure
+              everything gets sent again next time.
+            </p>
+            {resendConfirmed && <p>Done — all your entries will be included in the next sync.</p>}
+          </div>
           <button onClick={() => setShowSettings(false)}>Close</button>
         </div>
       )}
