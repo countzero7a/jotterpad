@@ -14,6 +14,8 @@ export function isEntry(value: unknown): value is Entry {
   if (typeof e.deleted !== 'boolean') return false;
   if (e.eventDate !== undefined && typeof e.eventDate !== 'string') return false;
   if (e.eventTime !== undefined && typeof e.eventTime !== 'string') return false;
+  if (e.linkedNoteId !== undefined && typeof e.linkedNoteId !== 'string') return false;
+  if (e.deletedAt !== undefined && typeof e.deletedAt !== 'number') return false;
   return true;
 }
 
