@@ -1982,4 +1982,18 @@ describe('App', () => {
     await screen.findByText(/all your entries will be included/i);
     expect(await getLastSentAt()).toBe(0);
   });
+
+  it('lets the user pick a theme from Settings, applying it immediately', async () => {
+    localStorage.clear();
+    document.documentElement.removeAttribute('data-theme');
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Blue' }));
+
+    expect(document.documentElement.getAttribute('data-theme')).toBe('blue');
+    expect(localStorage.getItem('jotterpad-theme')).toBe('blue');
+  });
 });

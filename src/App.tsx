@@ -8,6 +8,7 @@ import { ConflictResolver } from './components/ConflictResolver';
 import { ExportSettings } from './components/ExportSettings';
 import { ImportBackup } from './components/ImportBackup';
 import { ReminderSettings } from './components/ReminderSettings';
+import { ThemeSettings } from './components/ThemeSettings';
 import { isPinConfigured } from './auth/pin';
 import { getOrCreateDeviceId, setLastSentAt } from './storage/db';
 import { getAllEntries, saveEntry } from './storage/entryRepository';
@@ -583,6 +584,7 @@ export default function App() {
           <ExportSettings entries={entries} />
           <ImportBackup cryptoKey={cryptoKey} localEntries={entries} onImported={handleMerged} />
           <ReminderSettings />
+          <ThemeSettings />
           <div>
             <button
               onClick={() => {
