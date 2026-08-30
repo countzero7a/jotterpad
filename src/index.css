@@ -22,6 +22,7 @@
 }
 
 :root[data-theme='light'] {
+  color-scheme: light;
   --bg: #ffffff;
   --fg: #1c1c1e;
   --muted: #6b6b70;
@@ -32,6 +33,7 @@
 }
 
 :root[data-theme='dark'] {
+  color-scheme: dark;
   --bg: #1c1c1e;
   --fg: #f2f2f2;
   --muted: #9a9a9e;
@@ -42,6 +44,7 @@
 }
 
 :root[data-theme='blue'] {
+  color-scheme: light;
   --bg: #ffffff;
   --fg: #1c1c1e;
   --muted: #6b6b70;

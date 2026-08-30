@@ -8,8 +8,12 @@ function isTheme(value: string | null): value is Theme {
 }
 
 export function getStoredTheme(): Theme {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  return isTheme(raw) ? raw : 'auto';
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return isTheme(raw) ? raw : 'auto';
+  } catch {
+    return 'auto';
+  }
 }
 
 export function applyTheme(theme: Theme): void {
@@ -21,6 +25,10 @@ export function applyTheme(theme: Theme): void {
 }
 
 export function setTheme(theme: Theme): void {
-  localStorage.setItem(STORAGE_KEY, theme);
+  try {
+    localStorage.setItem(STORAGE_KEY, theme);
+  } catch {
+    // Silently ignore localStorage errors; theme still gets applied to DOM
+  }
   applyTheme(theme);
 }

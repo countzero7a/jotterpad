@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { getStoredTheme, applyTheme, setTheme } from './theme';
 
 describe('theme', () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     localStorage.clear();
     document.documentElement.removeAttribute('data-theme');
   });
@@ -19,6 +20,13 @@ describe('theme', () => {
 
     it('falls back to "auto" for an invalid stored value', () => {
       localStorage.setItem('jotterpad-theme', 'nonsense');
+      expect(getStoredTheme()).toBe('auto');
+    });
+
+    it('returns "auto" when localStorage.getItem throws', () => {
+      vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+        throw new Error('SecurityError');
+      });
       expect(getStoredTheme()).toBe('auto');
     });
   });
@@ -48,6 +56,14 @@ describe('theme', () => {
       setTheme('auto');
       expect(localStorage.getItem('jotterpad-theme')).toBe('auto');
       expect(document.documentElement.hasAttribute('data-theme')).toBe(false);
+    });
+
+    it('does not throw when localStorage.setItem throws, but still applies theme', () => {
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+        throw new Error('SecurityError');
+      });
+      expect(() => setTheme('dark')).not.toThrow();
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
     });
   });
 });
