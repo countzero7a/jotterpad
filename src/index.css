@@ -48,10 +48,10 @@
   --bg: #ffffff;
   --fg: #1c1c1e;
   --muted: #6b6b70;
-  --border: #e0e0e2;
-  --accent: #1565c0;
+  --border: #a9c8ec;
+  --accent: #0958a5;
   --danger: #d33;
-  --surface: #f0f5ff;
+  --surface: #dceafd;
 }
 
 * {
