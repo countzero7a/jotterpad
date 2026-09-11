@@ -1,15 +1,21 @@
-export const REMINDER_LEAD_OPTIONS: readonly number[] = [
-  0,
-  5 * 60 * 1000,
-  15 * 60 * 1000,
-  30 * 60 * 1000,
-  60 * 60 * 1000,
+export type ReminderLeadTime = 0 | 300000 | 900000 | 1800000 | 3600000;
+
+// Values must be written as numeric literals (not arithmetic expressions like
+// `5 * 60 * 1000`): TypeScript does not narrow the result of an arithmetic
+// expression down to a literal type, so an expression here would fail to
+// satisfy the ReminderLeadTime union and defeat the compile-time drift check.
+export const REMINDER_LEAD_OPTIONS: readonly ReminderLeadTime[] = [
+  0, // at event time
+  300000, // 5 minutes
+  900000, // 15 minutes
+  1800000, // 30 minutes
+  3600000, // 1 hour
 ];
 
 const STORAGE_KEY = 'jotterpad-reminder-lead-ms';
 
 function isValidLeadTime(value: number): boolean {
-  return REMINDER_LEAD_OPTIONS.includes(value);
+  return REMINDER_LEAD_OPTIONS.includes(value as ReminderLeadTime);
 }
 
 export function getReminderLeadTime(): number {
@@ -23,7 +29,7 @@ export function getReminderLeadTime(): number {
   }
 }
 
-export function setReminderLeadTime(ms: number): void {
+export function setReminderLeadTime(ms: ReminderLeadTime): void {
   try {
     localStorage.setItem(STORAGE_KEY, String(ms));
   } catch {

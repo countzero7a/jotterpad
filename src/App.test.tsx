@@ -520,6 +520,7 @@ describe('App', () => {
   });
 
   it('reschedules reminders immediately when the reminder lead time is changed in Settings', async () => {
+    localStorage.clear();
     const user = userEvent.setup();
     render(<App />);
     await setPinThroughUi(user);

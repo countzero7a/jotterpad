@@ -62,7 +62,7 @@ describe('reminders', () => {
   });
 
   it('shifts the scheduled notification earlier by the configured lead time, and adds the event time to the body', () => {
-    setReminderLeadTime(15 * 60 * 1000);
+    setReminderLeadTime(900000); // 15 minutes
     const event = createEvent('dentist', '2026-07-23', '18:00', 'device-1');
     scheduleEventReminders([event]);
 
@@ -73,13 +73,17 @@ describe('reminders', () => {
     expect(notificationSpy).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(2000);
+    const eventTime = new Date(2026, 6, 23, 18, 0).toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
     expect(notificationSpy).toHaveBeenCalledWith('Jotterpad reminder', {
-      body: 'dentist (at 6:00 PM)',
+      body: `dentist (at ${eventTime})`,
     });
   });
 
   it('does not schedule a reminder when the lead time would push the notify time into the past', () => {
-    setReminderLeadTime(15 * 60 * 1000);
+    setReminderLeadTime(900000); // 15 minutes
     // Event is only 10 minutes from "now" -- a 15-minute lead time would
     // need to notify 5 minutes ago, which is impossible.
     const event = createEvent('soon', '2026-07-23', '12:10', 'device-1');
@@ -89,7 +93,7 @@ describe('reminders', () => {
   });
 
   it('pulls an event that is just past the 24-hour window into range once the lead time shifts its notify time earlier', () => {
-    setReminderLeadTime(15 * 60 * 1000);
+    setReminderLeadTime(900000); // 15 minutes
     // Event is 24h10m from "now" -- outside the 24h window at its own
     // timestamp, but its lead-shifted notify time (23h55m from "now") is
     // inside the window.
@@ -98,8 +102,12 @@ describe('reminders', () => {
     vi.advanceTimersByTime(23 * 60 * 60 * 1000 + 55 * 60 * 1000 - 1000);
     expect(notificationSpy).not.toHaveBeenCalled();
     vi.advanceTimersByTime(2000);
+    const eventTime = new Date(2026, 6, 24, 12, 10).toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
     expect(notificationSpy).toHaveBeenCalledWith('Jotterpad reminder', {
-      body: 'just outside (at 12:10 PM)',
+      body: `just outside (at ${eventTime})`,
     });
   });
 

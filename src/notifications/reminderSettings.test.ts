@@ -41,7 +41,7 @@ describe('reminderSettings', () => {
 
   describe('setReminderLeadTime', () => {
     it('persists the chosen value so it can be read back', () => {
-      setReminderLeadTime(30 * 60 * 1000);
+      setReminderLeadTime(1800000); // 30 minutes
       expect(localStorage.getItem('jotterpad-reminder-lead-ms')).toBe(String(30 * 60 * 1000));
       expect(getReminderLeadTime()).toBe(30 * 60 * 1000);
     });
@@ -50,7 +50,7 @@ describe('reminderSettings', () => {
       vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
         throw new Error('SecurityError');
       });
-      expect(() => setReminderLeadTime(30 * 60 * 1000)).not.toThrow();
+      expect(() => setReminderLeadTime(1800000)).not.toThrow(); // 30 minutes
     });
   });
 });
