@@ -583,7 +583,7 @@ export default function App() {
         <div className="settings">
           <ExportSettings entries={entries} />
           <ImportBackup cryptoKey={cryptoKey} localEntries={entries} onImported={handleMerged} />
-          <ReminderSettings />
+          <ReminderSettings onLeadTimeChange={() => scheduleEventReminders(entriesRef.current)} />
           <ThemeSettings />
           <div>
             <button
