@@ -43,7 +43,7 @@ To reschedule immediately, `ReminderSettings` accepts a new optional `onLeadTime
 ## 7. Testing
 
 - New tests for `reminderSettings.ts` mirroring `theme.test.ts`'s coverage: default fallback when unset, validation of a stored value against the five allowed options, fallback on an invalid/corrupt stored value, and behavior when `localStorage` throws.
-- Extend `reminders.test.ts` to cover: the scheduling delay shifts earlier by the configured lead time; an event that would have been within the 24-hour window at its own timestamp is correctly excluded once shifted past that window by the lead time; the notification body includes the formatted event time when lead time is non-zero and excludes it when zero.
+- Extend `reminders.test.ts` to cover: the scheduling delay shifts earlier by the configured lead time; since shifting the trigger point earlier can only pull an event into the 24-hour window (from being too far away) or push it into the past (from being too soon), not push it beyond the window's far edge, cover both of those real boundary cases — an event whose notify time is pulled into the window from just outside it, and one whose notify time is pushed into the past by a lead time larger than its remaining time; the notification body includes the formatted event time when lead time is non-zero and excludes it when zero.
 - New test in `ReminderSettings.test.tsx` (new file, following the pattern of `TagFilterBar.test.tsx`/`ThemeSettings.test.tsx`) verifying the button group renders, clicking a button calls `setReminderLeadTime` and the `onLeadTimeChange` callback, and the active button reflects the current stored value on mount.
 
 ## 8. Explicitly Out of Scope
