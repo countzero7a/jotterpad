@@ -1,4 +1,5 @@
 import { Entry } from '../models/entry';
+import { getReminderLeadTime } from './reminderSettings';
 
 export async function requestNotificationPermission(): Promise<NotificationPermission> {
   if (!('Notification' in window)) return 'denied';
@@ -29,15 +30,22 @@ export function scheduleEventReminders(events: Entry[]): void {
   scheduledTimers.forEach((timerId) => clearTimeout(timerId));
   scheduledTimers.clear();
 
+  const leadTimeMs = getReminderLeadTime();
+
   events
     .filter((e) => e.type === 'event' && !e.deleted && e.eventDate)
     .forEach((event) => {
       const when = new Date(`${event.eventDate}T${event.eventTime || '00:00'}`).getTime();
-      const delay = when - Date.now();
+      const notifyAt = when - leadTimeMs;
+      const delay = notifyAt - Date.now();
       if (delay > 0 && delay < 24 * 60 * 60 * 1000) {
         const timerId = setTimeout(() => {
           if (Notification.permission === 'granted') {
-            fireNotification('Jotterpad reminder', event.text).catch(() => {});
+            const body =
+              leadTimeMs > 0
+                ? `${event.text} (at ${new Date(when).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })})`
+                : event.text;
+            fireNotification('Jotterpad reminder', body).catch(() => {});
           }
           scheduledTimers.delete(event.id);
         }, delay);

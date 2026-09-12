@@ -1,11 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { requestNotificationPermission, scheduleEventReminders } from './reminders';
+import { setReminderLeadTime } from './reminderSettings';
 import { createEvent } from '../models/entry';
 
 describe('reminders', () => {
   const notificationSpy = vi.fn();
 
   beforeEach(() => {
+    localStorage.clear();
     vi.useFakeTimers();
     // Local-time construction (not a UTC ISO string) so "now" and the
     // production code's local-time event parsing agree on the same
@@ -57,6 +59,56 @@ describe('reminders', () => {
     scheduleEventReminders([event]);
     vi.advanceTimersByTime(6 * 60 * 60 * 1000 + 1000);
     expect(notificationSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('shifts the scheduled notification earlier by the configured lead time, and adds the event time to the body', () => {
+    setReminderLeadTime(900000); // 15 minutes
+    const event = createEvent('dentist', '2026-07-23', '18:00', 'device-1');
+    scheduleEventReminders([event]);
+
+    // "now" is 2026-07-23 12:00 (set in beforeEach). Event is at 18:00, a
+    // 15-minute lead time means the notification should fire at 17:45,
+    // i.e. 5h45m after "now" -- not at the original 6h delay.
+    vi.advanceTimersByTime(5 * 60 * 60 * 1000 + 45 * 60 * 1000 - 1000);
+    expect(notificationSpy).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(2000);
+    const eventTime = new Date(2026, 6, 23, 18, 0).toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+    expect(notificationSpy).toHaveBeenCalledWith('Jotterpad reminder', {
+      body: `dentist (at ${eventTime})`,
+    });
+  });
+
+  it('does not schedule a reminder when the lead time would push the notify time into the past', () => {
+    setReminderLeadTime(900000); // 15 minutes
+    // Event is only 10 minutes from "now" -- a 15-minute lead time would
+    // need to notify 5 minutes ago, which is impossible.
+    const event = createEvent('soon', '2026-07-23', '12:10', 'device-1');
+    scheduleEventReminders([event]);
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(notificationSpy).not.toHaveBeenCalled();
+  });
+
+  it('pulls an event that is just past the 24-hour window into range once the lead time shifts its notify time earlier', () => {
+    setReminderLeadTime(900000); // 15 minutes
+    // Event is 24h10m from "now" -- outside the 24h window at its own
+    // timestamp, but its lead-shifted notify time (23h55m from "now") is
+    // inside the window.
+    const event = createEvent('just outside', '2026-07-24', '12:10', 'device-1');
+    scheduleEventReminders([event]);
+    vi.advanceTimersByTime(23 * 60 * 60 * 1000 + 55 * 60 * 1000 - 1000);
+    expect(notificationSpy).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2000);
+    const eventTime = new Date(2026, 6, 24, 12, 10).toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+    expect(notificationSpy).toHaveBeenCalledWith('Jotterpad reminder', {
+      body: `just outside (at ${eventTime})`,
+    });
   });
 
   it('prefers the service worker registration over the Notification constructor when available', () => {

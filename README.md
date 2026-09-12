@@ -18,7 +18,7 @@ That tradeoff is deliberate: no account and no cloud means no server to breach, 
 - **PIN-encrypted storage** — a numeric PIN unlocks the app each time it's opened; all content is encrypted at rest (PBKDF2 + AES-256-GCM via the Web Crypto API).
 - **Device-to-device sync via QR code** — no WiFi, no internet, no server. Two devices exchange an animated sequence of QR codes to merge their notes, with automatic conflict detection if both sides edited the same entry.
 - **Encrypted backup export/import** — export all your data as an encrypted file, protected by your device PIN or a separate one-off passphrase.
-- **Local reminders** — browser notifications for upcoming events, while the app is open.
+- **Local reminders** — browser notifications for upcoming events, while the app is open. Choose how much advance notice you get: at event time, or 5/15/30 minutes/1 hour before.
 - **Installable PWA** — add it to your home screen or desktop like a native app; works offline.
 - **Themes** — Auto (follows system), Light, Dark, and Blue.
 
@@ -87,4 +87,4 @@ Pushing to `master` automatically deploys the `dist/` build to GitHub Pages (see
 
 ## Design docs
 
-Full design specs and implementation plans for each feature are in [`docs/superpowers/`](docs/superpowers/), including the [original app design](docs/superpowers/specs/2026-07-23-jotterpad-design.md) and the [theme support design](docs/superpowers/specs/2026-08-30-theme-support-design.md).
+Full design specs and implementation plans for each feature are in [`docs/superpowers/`](docs/superpowers/), including the [original app design](docs/superpowers/specs/2026-07-23-jotterpad-design.md), the [theme support design](docs/superpowers/specs/2026-08-30-theme-support-design.md), and the [configurable reminder lead-time design](docs/superpowers/specs/2026-09-10-reminder-lead-time-design.md).

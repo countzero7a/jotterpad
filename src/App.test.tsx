@@ -519,6 +519,23 @@ describe('App', () => {
     expect(lastCallEntries.some((e) => e.text === 'reminder regression note')).toBe(true);
   });
 
+  it('reschedules reminders immediately when the reminder lead time is changed in Settings', async () => {
+    localStorage.clear();
+    const user = userEvent.setup();
+    render(<App />);
+    await setPinThroughUi(user);
+
+    await waitFor(() => expect(vi.mocked(scheduleEventReminders).mock.calls.length).toBeGreaterThan(0));
+    const callsBeforeChange = vi.mocked(scheduleEventReminders).mock.calls.length;
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(await screen.findByRole('button', { name: '15 min before' }));
+
+    await waitFor(() =>
+      expect(vi.mocked(scheduleEventReminders).mock.calls.length).toBeGreaterThan(callsBeforeChange)
+    );
+  });
+
   it('shows a pending conflict that was persisted from a previous session', async () => {
     const { setPendingConflicts } = await import('./sync/conflictStore');
     const { createNote } = await import('./models/entry');
